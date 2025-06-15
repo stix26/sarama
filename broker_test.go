@@ -91,7 +91,7 @@ type produceResOrError struct {
 
 func newProduceResponsePromise() produceResponsePromise {
 	return produceResponsePromise{
-		c: make(chan produceResOrError, 0),
+		c: make(chan produceResOrError),
 	}
 }
 
@@ -198,7 +198,7 @@ func TestBrokerFailedRequest(t *testing.T) {
 	}
 }
 
-var ErrTokenFailure = errors.New("Failure generating token")
+var ErrTokenFailure = errors.New("failure generating token")
 
 type TokenProvider struct {
 	accessToken *AccessToken
