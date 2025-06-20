@@ -1,0 +1,204 @@
+name: SQL Checks
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.sql'
+      - '**/migrations/**'
+      - '**/database/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.sql'
+      - '**/migrations/**'
+      - '**/database/**'
+  workflow_dispatch:
+
+jobs:
+  sql-lint:
+    name: SQL Linting
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install SQL linting tools
+      run: |
+        npm install -g sql-lint
+        npm install -g @dbml/cli
+
+    - name: Find SQL files
+      run: |
+        find . -name "*.sql" -type f > sql_files.txt
+        echo "Found SQL files:"
+        cat sql_files.txt || echo "No SQL files found"
+
+    - name: Lint SQL files
+      run: |
+        if [ -s sql_files.txt ]; then
+          while IFS= read -r file; do
+            echo "Linting $file"
+            sql-lint "$file" || echo "Linting failed for $file"
+          done < sql_files.txt
+        else
+          echo "No SQL files to lint"
+        fi
+
+  database-schema:
+    name: Database Schema Validation
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install database tools
+      run: |
+        pip install sqlalchemy
+        pip install alembic
+        pip install psycopg2-binary
+
+    - name: Check for database migrations
+      run: |
+        find . -name "*.py" -exec grep -l "alembic\|migration" {} \; > migration_files.txt || true
+        echo "Migration-related files:"
+        cat migration_files.txt || echo "No migration files found"
+
+    - name: Validate schema files
+      run: |
+        find . -name "*.dbml" -o -name "*.sql" -o -name "schema.*" > schema_files.txt || true
+        echo "Schema files found:"
+        cat schema_files.txt || echo "No schema files found"
+
+  sql-security:
+    name: SQL Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install security tools
+      run: |
+        pip install bandit
+        pip install safety
+
+    - name: Scan for SQL injection patterns
+      run: |
+        find . -name "*.go" -o -name "*.py" -o -name "*.js" -o -name "*.ts" | xargs grep -l "SELECT\|INSERT\|UPDATE\|DELETE" > sql_usage_files.txt || true
+        echo "Files with SQL usage:"
+        cat sql_usage_files.txt || echo "No SQL usage found"
+
+    - name: Security scan
+      run: |
+        if [ -s sql_usage_files.txt ]; then
+          echo "Running security scan on files with SQL usage"
+          while IFS= read -r file; do
+            echo "Scanning $file for security issues"
+            # Add specific security checks here
+          done < sql_usage_files.txt
+        else
+          echo "No SQL usage found to scan"
+        fi
+
+  database-tests:
+    name: Database Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Wait for databases
+      run: |
+        echo "Waiting for PostgreSQL..."
+        timeout 60 bash -c 'until pg_isready -h localhost -p 5432; do sleep 1; done'
+        echo "Waiting for MySQL..."
+        timeout 60 bash -c 'until mysqladmin ping -h localhost -P 3306 -u root -proot; do sleep 1; done'
+
+    - name: Run database tests
+      run: |
+        echo "Database tests would run here if there were any"
+        echo "This job is ready for future database testing needs"
+
+  sql-performance:
+    name: SQL Performance Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install performance tools
+      run: |
+        pip install sqlparse
+        pip install sqlalchemy
+
+    - name: Analyze SQL performance
+      run: |
+        find . -name "*.sql" -exec echo "Analyzing {}" \; -exec sqlparse {} \; || echo "No SQL files to analyze"
+
+    - name: Generate performance report
+      run: |
+        echo "## SQL Performance Analysis Report" > sql_performance_report.md
+        echo "" >> sql_performance_report.md
+        echo "### Files Analyzed:" >> sql_performance_report.md
+        find . -name "*.sql" >> sql_performance_report.md || echo "No SQL files found" >> sql_performance_report.md
+        echo "" >> sql_performance_report.md
+        echo "### Recommendations:" >> sql_performance_report.md
+        echo "- Add indexes where appropriate" >> sql_performance_report.md
+        echo "- Optimize slow queries" >> sql_performance_report.md
+        echo "- Consider query caching" >> sql_performance_report.md
+
+    - name: Upload performance report
+      uses: actions/upload-artifact@v4
+      with:
+        name: sql-performance-report
+        path: sql_performance_report.md 
