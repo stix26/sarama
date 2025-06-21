@@ -61,7 +61,7 @@ jobs:
         DEBUG: true
 
     - name: Upload test coverage
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         file: ./profile.out
         flags: unittests
