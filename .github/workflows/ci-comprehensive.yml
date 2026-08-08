@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [1.23, 1.24, 1.25]
+        go-version: [1.25, 1.26]
         os: [ubuntu-latest]
     steps:
     - name: Checkout code
@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [1.23]
+        go-version: [1.26]
     env:
       DEBUG: true
       KAFKA_VERSION: 3.6.2
@@ -132,7 +132,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
@@ -201,7 +201,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: [1.23, 1.24, 1.25]
+        go-version: [1.25, 1.26]
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
     - name: Checkout code
@@ -250,7 +250,7 @@ jobs:
 
     - name: Build Kafka Docker image
       run: |
-        docker build -f Dockerfile.kafka -t sarama-kafka:test .
+        docker build --build-arg KAFKA_VERSION=3.6.2 --build-arg SCALA_VERSION=2.13 -f Dockerfile.kafka -t sarama-kafka:test .
         docker images
 
     - name: Test Docker image
@@ -302,7 +302,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: Install dependencies
       run: go mod download
@@ -343,7 +343,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: Install dependencies
       run: go mod download
@@ -369,7 +369,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: Check documentation
       run: |
