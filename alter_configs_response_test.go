@@ -3,6 +3,7 @@
 package sarama
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -19,6 +20,17 @@ var (
 		0, 0, // string
 		2, // topic
 		0, 3, 'f', 'o', 'o',
+	}
+
+	alterResponsePopulatedV2 = []byte{
+		0, 0, 0, 0, // ThrottleTimeMs
+		2,    // Responses
+		0, 0, // ErrorCode
+		1,                // ErrorMessage
+		2,                // ResourceType
+		4, 'f', 'o', 'o', // ResourceName
+		0, // tagged fields (resource)
+		0, // tagged fields
 	}
 )
 
@@ -44,4 +56,38 @@ func TestAlterConfigsResponse(t *testing.T) {
 		},
 	}
 	testResponse(t, "response with error", response, alterResponsePopulated)
+
+	response.Version = 2
+	testResponse(t, "response with error v2", response, alterResponsePopulatedV2)
+}
+
+func TestAlterConfigError(t *testing.T) {
+	// Assert that AlterConfigError satisfies error interface
+	var err error = &AlterConfigError{
+		Err: ErrInvalidConfig,
+	}
+
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected errors.Is to match ErrInvalidConfig")
+	}
+
+	got := err.Error()
+	want := ErrInvalidConfig.Error()
+	if got != want {
+		t.Errorf("AlterConfigError.Error() = %v; want %v", got, want)
+	}
+
+	err = &AlterConfigError{
+		Err:    ErrInvalidConfig,
+		ErrMsg: "invalid config value",
+	}
+	got = err.Error()
+	want = ErrInvalidConfig.Error() + " - invalid config value"
+	if got != want {
+		t.Errorf("AlterConfigError.Error() = %v; want %v", got, want)
+	}
+
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("expected errors.Is to match ErrInvalidConfig with ErrMsg set")
+	}
 }

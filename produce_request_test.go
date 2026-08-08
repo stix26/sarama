@@ -73,6 +73,44 @@ var (
 		0x06, 0x08, 0x09, 0x0A,
 		0x04, 0x0B, 0x0C,
 	}
+
+	produceRequestOneRecordV9 = []byte{
+		0x00,       // Transaction ID
+		0x01, 0x23, // Required Acks
+		0x00, 0x00, 0x04, 0x44, // Timeout
+		0x02,                          // Number of Topics
+		0x06, 't', 'o', 'p', 'i', 'c', // Topic
+		0x02,                   // Number of Partitions
+		0x00, 0x00, 0x00, 0xAD, // Partition
+		0x53, // Records length
+		// recordBatch
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x46,
+		0x00, 0x00, 0x00, 0x00,
+		0x02,
+		0xCA, 0x33, 0xBC, 0x05,
+		0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x01, 0x58, 0x8D, 0xCD, 0x59, 0x38,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01,
+		// record
+		0x28,
+		0x00,
+		0x0A,
+		0x00,
+		0x08, 0x01, 0x02, 0x03, 0x04,
+		0x06, 0x05, 0x06, 0x07,
+		0x02,
+		0x06, 0x08, 0x09, 0x0A,
+		0x04, 0x0B, 0x0C,
+		0x00, // partition tagged fields
+		0x00, // topic tagged fields
+		0x00, // request tagged fields
+	}
 )
 
 func TestProduceRequest(t *testing.T) {
@@ -108,4 +146,51 @@ func TestProduceRequest(t *testing.T) {
 	// are only interested in decoded records.
 	batch.compressedRecords = nil
 	testRequestDecode(t, "one record", request, packet)
+
+	request.Version = 9
+	packet = testRequestEncode(t, "one record v9", request, produceRequestOneRecordV9)
+	batch.compressedRecords = nil
+	testRequestDecode(t, "one record v9", request, packet)
+}
+
+func benchmarkProduceRequestEncodeMetrics(b *testing.B, partitions int) {
+	b.Helper()
+
+	produceReq := &ProduceRequest{
+		RequiredAcks: WaitForLocal,
+		Timeout:      1_000,
+	}
+	for partition := range partitions {
+		produceReq.AddMessage("bench.topic", int32(partition), &Message{
+			Codec: CompressionNone,
+			Value: []byte("payload"),
+		})
+	}
+
+	req := &request{
+		correlationID: 1,
+		clientID:      "bench",
+		body:          produceReq,
+	}
+	metricRegistry := NewConfig().MetricRegistry
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := encode(req, metricRegistry); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkProduceRequestEncodeMetrics1Partition(b *testing.B) {
+	benchmarkProduceRequestEncodeMetrics(b, 1)
+}
+
+func BenchmarkProduceRequestEncodeMetrics32Partitions(b *testing.B) {
+	benchmarkProduceRequestEncodeMetrics(b, 32)
+}
+
+func BenchmarkProduceRequestEncodeMetrics128Partitions(b *testing.B) {
+	benchmarkProduceRequestEncodeMetrics(b, 128)
 }

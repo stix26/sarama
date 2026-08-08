@@ -22,6 +22,29 @@ var (
 	}
 
 	createTopicsRequestV1 = append(createTopicsRequestV0, byte(1))
+
+	createTopicsRequestV5 = []byte{
+		2,
+		6, 't', 'o', 'p', 'i', 'c',
+		255, 255, 255, 255,
+		255, 255,
+		2,          // 1 replica assignment
+		0, 0, 0, 0, // partition index
+		4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, // broker ids
+		0, // empty tagged fields
+		2, // 1 config
+		13, 'r', 'e', 't', 'e', 'n', 't', 'i', 'o', 'n', '.', 'm', 's',
+		3, '-', '1',
+		0, // empty tagged fields
+		0, // empty tagged fields
+		0, 0, 0, 100,
+		1,
+		0, // empty tagged fields
+	}
+
+	createTopicsRequestV6 = createTopicsRequestV5
+
+	createTopicsRequestV7 = createTopicsRequestV5
 )
 
 func TestCreateTopicsRequest(t *testing.T) {
@@ -49,4 +72,13 @@ func TestCreateTopicsRequest(t *testing.T) {
 	req.ValidateOnly = true
 
 	testRequest(t, "version 1", req, createTopicsRequestV1)
+
+	req.Version = 5
+	testRequest(t, "version 5", req, createTopicsRequestV5)
+
+	req.Version = 6
+	testRequest(t, "version 6", req, createTopicsRequestV6)
+
+	req.Version = 7
+	testRequest(t, "version 7", req, createTopicsRequestV7)
 }

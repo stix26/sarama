@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/IBM/sarama/internal/toxiproxy"
@@ -172,8 +174,8 @@ func TestFuncTxnProduce(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	nonTransactionalProducer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, NewFunctionalTestConfig())
@@ -182,7 +184,7 @@ func TestFuncTxnProduce(t *testing.T) {
 
 	// Ensure consumer is started
 	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
 	producer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	require.NoError(t, err)
@@ -199,7 +201,7 @@ func TestFuncTxnProduce(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 1; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 	}
 }
@@ -225,8 +227,8 @@ func TestFuncTxnProduceWithBrokerFailure(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	nonTransactionalProducer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, NewFunctionalTestConfig())
@@ -235,7 +237,7 @@ func TestFuncTxnProduceWithBrokerFailure(t *testing.T) {
 
 	// Ensure consumer is started
 	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
 	producer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	require.NoError(t, err)
@@ -246,16 +248,15 @@ func TestFuncTxnProduceWithBrokerFailure(t *testing.T) {
 	err = producer.BeginTxn()
 	require.NoError(t, err)
 
-	if err := stopDockerTestBroker(context.Background(), txCoordinator.id); err != nil {
-		t.Fatal(err)
-	}
-
 	defer func() {
 		if err := startDockerTestBroker(context.Background(), txCoordinator.id); err != nil {
 			t.Fatal(err)
 		}
 		t.Logf("\n")
 	}()
+	if err := stopDockerTestBroker(context.Background(), txCoordinator.id); err != nil {
+		t.Fatal(err)
+	}
 
 	for i := 0; i < 1; i++ {
 		producer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
@@ -265,7 +266,7 @@ func TestFuncTxnProduceWithBrokerFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 1; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 	}
 }
@@ -291,8 +292,8 @@ func TestFuncTxnProduceEpochBump(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	nonTransactionalProducer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, NewFunctionalTestConfig())
@@ -301,7 +302,7 @@ func TestFuncTxnProduceEpochBump(t *testing.T) {
 
 	// Ensure consumer is started
 	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
 	producer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	require.NoError(t, err)
@@ -318,7 +319,7 @@ func TestFuncTxnProduceEpochBump(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 1; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 	}
 
@@ -333,7 +334,7 @@ func TestFuncTxnProduceEpochBump(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 1; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 	}
 }
@@ -358,38 +359,116 @@ func TestFuncInitProducerId3(t *testing.T) {
 	require.NoError(t, err)
 	defer producer.Close()
 
-	require.Equal(t, true, producer.(*asyncProducer).txnmgr.coordinatorSupportsBumpingEpoch)
+	require.True(t, producer.(*asyncProducer).txnmgr.coordinatorSupportsBumpingEpoch)
 }
 
 type messageHandler struct {
 	*testing.T
-	h       func(*ConsumerMessage)
-	started sync.WaitGroup
+	h       func(ConsumerGroupSession, *ConsumerMessage)
+	claimed chan int32
 }
 
 func (h *messageHandler) Setup(s ConsumerGroupSession) error   { return nil }
 func (h *messageHandler) Cleanup(s ConsumerGroupSession) error { return nil }
 func (h *messageHandler) ConsumeClaim(sess ConsumerGroupSession, claim ConsumerGroupClaim) error {
-	h.started.Done()
+	h.Logf("claimed %s/%d starting at offset %d (high water mark %d)",
+		claim.Topic(), claim.Partition(), claim.InitialOffset(), claim.HighWaterMarkOffset())
+
+	h.claimed <- claim.Partition()
 
 	for msg := range claim.Messages() {
 		h.Logf("consumed msg %v", msg)
-		h.h(msg)
+		h.h(sess, msg)
 	}
 	return nil
 }
 
+// claims resolve their start offsets when created, so wait for all of them
+// before producing to a randomly selected partition
+func (h *messageHandler) awaitClaims(partitions []int32) {
+	h.Helper()
+	remaining := make(map[int32]struct{}, len(partitions))
+	for _, partition := range partitions {
+		remaining[partition] = struct{}{}
+	}
+
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	for len(remaining) > 0 {
+		select {
+		case partition := <-h.claimed:
+			delete(remaining, partition)
+		case <-timer.C:
+			h.Fatalf("handler never claimed partitions %v", remaining)
+		}
+	}
+}
+
+// bound receives so a stall fails one test instead of timing out the suite
+func awaitMessage(t *testing.T, ch <-chan *ConsumerMessage, what string) *ConsumerMessage {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	select {
+	case msg, ok := <-ch:
+		if !ok {
+			t.Fatalf("message channel closed while waiting for %s", what)
+		}
+		return msg
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", what)
+		return nil
+	}
+}
+
 func TestFuncTxnProduceAndCommitOffset(t *testing.T) {
 	checkKafkaVersion(t, "0.11.0.0")
+
+	t.Run("legacy group ID", func(t *testing.T) {
+		testTxnProduceAndCommitOffset(t, MaxVersion, "TestFuncTxnProduceAndCommitOffset", "test-produce",
+			func(producer AsyncProducer, _ ConsumerGroupSession, msg *ConsumerMessage, groupID string) error {
+				return producer.AddMessageToTxn(msg, groupID, nil)
+			})
+	})
+
+	// test the v2/v3 TxnOffsetCommit protocol boundaries across broker versions
+	versions := []struct {
+		name     string
+		version  KafkaVersion
+		minKafka string
+	}{
+		{"v2", V2_1_0_0, "2.1.0"},
+		{"v3 with group metadata", V2_5_0_0, "2.5.0"},
+	}
+	for _, v := range versions {
+		t.Run(v.name, func(t *testing.T) {
+			checkKafkaVersion(t, v.minKafka)
+			groupID := "test-produce-" + v.version.String()
+			txnID := "TestFuncTxnProduceAndCommitOffset-" + v.version.String()
+			testTxnProduceAndCommitOffset(t, v.version, txnID, groupID,
+				func(producer AsyncProducer, sess ConsumerGroupSession, msg *ConsumerMessage, groupID string) error {
+					return producer.AddMessageToTxnWithGroupMetadata(msg, NewConsumerGroupMetadataFromSession(sess, groupID, nil), nil)
+				})
+		})
+	}
+}
+
+func testTxnProduceAndCommitOffset(
+	t *testing.T,
+	version KafkaVersion,
+	txnID, groupID string,
+	addOffsetToTxn func(producer AsyncProducer, sess ConsumerGroupSession, msg *ConsumerMessage, groupID string) error,
+) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
 	config := NewFunctionalTestConfig()
+	config.Version = version
 	config.ChannelBufferSize = 20
 	config.Producer.Flush.Frequency = 50 * time.Millisecond
 	config.Producer.Flush.Messages = 200
 	config.Producer.Idempotent = true
-	config.Producer.Transaction.ID = "TestFuncTxnProduceAndCommitOffset"
+	config.Producer.Transaction.ID = txnID
 	config.Producer.RequiredAcks = WaitForAll
 	config.Producer.Transaction.Retry.Max = 200
 	config.Consumer.IsolationLevel = ReadCommitted
@@ -408,34 +487,37 @@ func TestFuncTxnProduceAndCommitOffset(t *testing.T) {
 	require.NoError(t, err)
 	defer producer.Close()
 
-	cg, err := NewConsumerGroupFromClient("test-produce", client)
+	cg, err := NewConsumerGroupFromClient(groupID, client)
 	require.NoError(t, err)
 	defer cg.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handler := &messageHandler{}
+	topicPartitions := map[string][]int32{
+		"test.4": {0, 1, 2, 3},
+	}
+	handler := &messageHandler{
+		claimed: make(chan int32, len(topicPartitions["test.4"])),
+	}
 	handler.T = t
-	handler.h = func(msg *ConsumerMessage) {
-		err := producer.BeginTxn()
-		require.NoError(t, err)
+	handler.h = func(sess ConsumerGroupSession, msg *ConsumerMessage) {
+		require.NoError(t, producer.BeginTxn())
 		producer.Input() <- &ProducerMessage{Topic: "test.1", Value: StringEncoder("test-prod")}
-		err = producer.AddMessageToTxn(msg, "test-produce", nil)
-		require.NoError(t, err)
-		err = producer.CommitTxn()
-		require.NoError(t, err)
+		require.NoError(t, addOffsetToTxn(producer, sess, msg, groupID))
+		require.NoError(t, producer.CommitTxn())
 	}
 
-	handler.started.Add(4)
 	go func() {
 		err = cg.Consume(ctx, []string{"test.4"}, handler)
-		require.NoError(t, err)
+		assert.NoError(t, err)
 	}()
 
-	handler.started.Wait()
+	handler.awaitClaims(topicPartitions["test.4"])
 
-	nonTransactionalProducer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, NewFunctionalTestConfig())
+	nonTransactionalConfig := NewFunctionalTestConfig()
+	nonTransactionalConfig.Producer.Return.Successes = true
+	nonTransactionalProducer, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, nonTransactionalConfig)
 	require.NoError(t, err)
 	defer nonTransactionalProducer.Close()
 
@@ -444,26 +526,23 @@ func TestFuncTxnProduceAndCommitOffset(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	// Ensure consumer is started
-	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	_, _, err = nonTransactionalProducer.SendMessage(&ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")})
+	require.NoError(t, err)
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
-	for i := 0; i < 1; i++ {
-		nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.4", Key: nil, Value: StringEncoder("test")}
-	}
+	triggerPartition, triggerOffset, err := nonTransactionalProducer.SendMessage(&ProducerMessage{Topic: "test.4", Key: nil, Value: StringEncoder("test")})
+	require.NoError(t, err)
+	t.Logf("Produced trigger message to test.4-%d at offset %d", triggerPartition, triggerOffset)
 
-	for i := 0; i < 1; i++ {
-		msg := <-msgChannel
-		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
-	}
+	msg := awaitMessage(t, msgChannel, fmt.Sprintf("transactional message on test.1/0 triggered by test.4-%d at offset %d", triggerPartition, triggerOffset))
+	t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 
-	topicPartitions := make(map[string][]int32)
-	topicPartitions["test.4"] = []int32{0, 1, 2, 3}
-	topicsDescription, err := admin.ListConsumerGroupOffsets("test-produce", topicPartitions)
+	topicsDescription, err := admin.ListConsumerGroupOffsets(groupID, topicPartitions)
 	require.NoError(t, err)
 
 	for _, partition := range topicPartitions["test.4"] {
@@ -509,8 +588,8 @@ func TestFuncTxnProduceMultiTxn(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	nonTransactionalConfig := NewFunctionalTestConfig()
@@ -523,7 +602,7 @@ func TestFuncTxnProduceMultiTxn(t *testing.T) {
 
 	// Ensure consumer is started
 	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
 	producer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, config)
 	require.NoError(t, err)
@@ -554,7 +633,7 @@ func TestFuncTxnProduceMultiTxn(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 2; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 		require.Equal(t, "test-committed", string(msg.Value))
 	}
@@ -586,8 +665,8 @@ func TestFuncTxnAbortedProduce(t *testing.T) {
 	defer consumer.Close()
 
 	pc, err := consumer.ConsumePartition("test.1", 0, OffsetNewest)
-	msgChannel := pc.Messages()
 	require.NoError(t, err)
+	msgChannel := pc.Messages()
 	defer pc.Close()
 
 	nonTransactionalConfig := NewFunctionalTestConfig()
@@ -600,7 +679,7 @@ func TestFuncTxnAbortedProduce(t *testing.T) {
 
 	// Ensure consumer is started
 	nonTransactionalProducer.Input() <- &ProducerMessage{Topic: "test.1", Key: nil, Value: StringEncoder("test")}
-	<-msgChannel
+	awaitMessage(t, msgChannel, "warm-up message on test.1/0")
 
 	producer, err := NewAsyncProducerFromClient(client)
 	require.NoError(t, err)
@@ -626,7 +705,7 @@ func TestFuncTxnAbortedProduce(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		msg := <-msgChannel
+		msg := awaitMessage(t, msgChannel, "transactional message on test.1/0")
 		t.Logf("Received %s from %s-%d at offset %d", msg.Value, msg.Topic, msg.Partition, msg.Offset)
 		require.Equal(t, "non-transactional", string(msg.Value))
 	}
@@ -724,6 +803,110 @@ func TestFuncProducingIdempotentWithBrokerFailure(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestFuncIdempotentBufferedSequence(t *testing.T) {
+	checkKafkaVersion(t, "0.11.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	const (
+		topic           = "test.1"
+		partition int32 = 0
+	)
+
+	cfg := NewFunctionalTestConfig()
+	cfg.Net.MaxOpenRequests = 1
+	cfg.Producer.Idempotent = true
+	cfg.Producer.RequiredAcks = WaitForAll
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.Return.Errors = true
+	cfg.Producer.Retry.Max = 64
+	cfg.Producer.Retry.Backoff = 250 * time.Millisecond
+
+	start := time.Now()
+
+	producer, err := NewAsyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, cfg)
+	require.NoError(t, err)
+	defer producer.Close()
+
+	asyncProd, ok := producer.(*asyncProducer)
+	require.True(t, ok)
+
+	waitForMessages := func(count int) {
+		timeout := time.After(2 * time.Minute)
+		for count > 0 {
+			select {
+			case <-timeout:
+				t.Fatalf("timed out waiting for %d messages", count)
+			case perr := <-producer.Errors():
+				if perr != nil {
+					t.Logf("producer error: %v", perr.Err)
+				}
+				count--
+			case <-producer.Successes():
+				count--
+			}
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		producer.Input() <- &ProducerMessage{
+			Topic:     topic,
+			Partition: partition,
+			Value:     StringEncoder(fmt.Sprintf("warmup-%d", i)),
+		}
+	}
+	waitForMessages(5)
+
+	leader, err := asyncProd.client.Leader(topic, partition)
+	require.NoError(t, err)
+
+	bp := asyncProd.getBrokerProducer(leader)
+	defer asyncProd.unrefBrokerProducer(leader, bp)
+
+	asyncProd.inFlight.Add(1)
+	pp := &partitionProducer{
+		parent:         asyncProd,
+		topic:          topic,
+		partition:      partition,
+		brokerProducer: bp,
+		leader:         leader,
+		retryState:     make([]partitionRetryState, asyncProd.conf.Producer.Retry.Max+1),
+		highWatermark:  1,
+	}
+	pp.retryState[0].buf = []*ProducerMessage{{
+		Topic:     topic,
+		Partition: partition,
+		Value:     StringEncoder("buffered"),
+	}}
+	pp.flushRetryBuffers()
+
+	waitForMessages(1)
+
+	producer.Input() <- &ProducerMessage{
+		Topic:     topic,
+		Partition: partition,
+		Value:     StringEncoder("post-buffer"),
+	}
+	waitForMessages(1)
+
+	logSince := start.UTC().Format(time.RFC3339)
+	cmd := exec.Command(
+		"docker",
+		"compose",
+		"logs",
+		"--since",
+		logSince,
+		fmt.Sprintf("kafka-%d", leader.ID()),
+	)
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "failed to read broker logs: %s", out)
+
+	logs := string(out)
+	t.Logf("kafka-%d logs since %s:\n%s", leader.ID(), logSince, logs)
+	require.NotContains(t, logs, "OutOfOrderSequenceException", "leader logs contained out-of-order sequence errors:\n%s", logs)
 }
 
 func TestInterceptors(t *testing.T) {
@@ -836,27 +1019,43 @@ func testProducingMessages(t *testing.T, config *Config, minVersion KafkaVersion
 	for version := range kafkaVersions {
 		name := t.Name() + "-v" + version.String()
 		t.Run(name, func(t *testing.T) {
-			config.ClientID = name
-			config.MetricRegistry = metrics.NewRegistry()
+			// Clone the config to avoid data races between subtests
+			// when background goroutines from a closing client still
+			// reference the shared config object.
+			cfg := *config
+			cfg.ClientID = name
+			cfg.MetricRegistry = metrics.NewRegistry()
 			checkKafkaVersion(t, version.String())
-			config.Version = version
+			cfg.Version = version
 
-			client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
+			producerClient, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, &cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer safeClose(t, client)
+			defer safeClose(t, producerClient)
 
-			// Keep in mind the current offset
-			initialOffset, err := client.GetOffset("test.1", 0, OffsetNewest)
+			// Keep in mind the current offset (retry on transient leader election errors)
+			var initialOffset int64
+			for i := 0; i < 10; i++ {
+				initialOffset, err = producerClient.GetOffset("test.1", 0, OffsetNewest)
+				if err == nil {
+					break
+				}
+				if errors.Is(err, ErrLeaderNotAvailable) || errors.Is(err, ErrOffsetNotAvailable) {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				t.Fatal(err)
+			}
+			if err != nil {
+				t.Fatalf("GetOffset failed after retries: %v", err)
+			}
+
+			producer, err := NewAsyncProducerFromClient(producerClient)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			producer, err := NewAsyncProducerFromClient(client)
-			if err != nil {
-				t.Fatal(err)
-			}
+			defer safeClose(t, producer)
 
 			expectedResponses := TestBatchSize
 			for i := 1; i <= TestBatchSize; {
@@ -878,38 +1077,42 @@ func testProducingMessages(t *testing.T, config *Config, minVersion KafkaVersion
 					expectedResponses--
 				}
 			}
-			safeClose(t, producer)
 
 			// Validate producer metrics before using the consumer minus the offset request
-			validateProducerMetrics(t, client)
+			validateProducerMetrics(t, producerClient)
 
-			master, err := NewConsumerFromClient(client)
+			consumerClient, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, &cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			consumer, err := master.ConsumePartition("test.1", 0, initialOffset)
+			defer safeClose(t, consumerClient)
+			consumer, err := NewConsumerFromClient(consumerClient)
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer safeClose(t, consumer)
+			partitionConsumer, err := consumer.ConsumePartition("test.1", 0, initialOffset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer safeClose(t, partitionConsumer)
 
 			for i := 1; i <= TestBatchSize; i++ {
 				select {
 				case <-time.After(10 * time.Second):
 					t.Fatal("Not received any more events in the last 10 seconds.")
 
-				case err := <-consumer.Errors():
+				case err := <-partitionConsumer.Errors():
 					t.Error(err)
 
-				case message := <-consumer.Messages():
+				case message := <-partitionConsumer.Messages():
 					if string(message.Value) != fmt.Sprintf("testing %d", i) {
 						t.Fatalf("Unexpected message with index %d: %s", i, message.Value)
 					}
 				}
 			}
 
-			validateConsumerMetrics(t, client)
-
-			safeClose(t, consumer)
+			validateConsumerMetrics(t, consumerClient)
 		})
 	}
 }
@@ -1029,19 +1232,18 @@ func validateProducerMetrics(t *testing.T, client Client) {
 		}
 		metricValidators.registerForGlobalAndTopic("test_1", maxValHistogramValidator("compression-ratio", 1000))
 	} else {
-		// We record compression ratios of 1.00 (100 with a histogram) for every TestBatchSize record
-		if client.Config().Version.IsAtLeast(V0_11_0_0) {
-			// records will be grouped in batchSet rather than msgSet
-			metricValidators.registerForGlobalAndTopic("test_1", minCountHistogramValidator("compression-ratio", 3))
-		} else {
+		// We record compression ratios of 1.00 (100 with a histogram).
+		if !client.Config().Version.IsAtLeast(V0_11_0_0) {
+			// MessageSet metrics are recorded per message.
 			metricValidators.registerForGlobalAndTopic("test_1", countHistogramValidator("compression-ratio", TestBatchSize))
 		}
 		metricValidators.registerForGlobalAndTopic("test_1", minValHistogramValidator("compression-ratio", 100))
 		metricValidators.registerForGlobalAndTopic("test_1", maxValHistogramValidator("compression-ratio", 100))
 	}
 
-	// We send exactly TestBatchSize messages
-	metricValidators.registerForGlobalAndTopic("test_1", countMeterValidator("record-send-rate", TestBatchSize))
+	// We successfully deliver TestBatchSize messages, but retried produce requests can
+	// make the send-attempt metric higher than the final delivered message count.
+	metricValidators.registerForGlobalAndTopic("test_1", minCountMeterValidator("record-send-rate", TestBatchSize))
 	// We send at least one record per request
 	metricValidators.registerForGlobalAndTopic("test_1", minCountHistogramValidator("records-per-request", 1))
 	metricValidators.registerForGlobalAndTopic("test_1", minValHistogramValidator("records-per-request", 1))

@@ -214,7 +214,17 @@ var (
 	V3_8_0_0  = newKafkaVersion(3, 8, 0, 0)
 	V3_8_1_0  = newKafkaVersion(3, 8, 1, 0)
 	V3_9_0_0  = newKafkaVersion(3, 9, 0, 0)
+	V3_9_1_0  = newKafkaVersion(3, 9, 1, 0)
+	V3_9_2_0  = newKafkaVersion(3, 9, 2, 0)
 	V4_0_0_0  = newKafkaVersion(4, 0, 0, 0)
+	V4_0_1_0  = newKafkaVersion(4, 0, 1, 0)
+	V4_1_0_0  = newKafkaVersion(4, 1, 0, 0)
+	V4_1_1_0  = newKafkaVersion(4, 1, 1, 0)
+	V4_1_2_0  = newKafkaVersion(4, 1, 2, 0)
+	V4_2_0_0  = newKafkaVersion(4, 2, 0, 0)
+	V4_2_1_0  = newKafkaVersion(4, 2, 1, 0)
+	V4_3_0_0  = newKafkaVersion(4, 3, 0, 0)
+	V4_3_1_0  = newKafkaVersion(4, 3, 1, 0)
 
 	SupportedVersions = []KafkaVersion{
 		V0_8_2_0,
@@ -287,11 +297,22 @@ var (
 		V3_8_0_0,
 		V3_8_1_0,
 		V3_9_0_0,
+		V3_9_1_0,
+		V3_9_2_0,
 		V4_0_0_0,
+		V4_0_1_0,
+		V4_1_0_0,
+		V4_1_1_0,
+		V4_1_2_0,
+		V4_2_0_0,
+		V4_2_1_0,
+		V4_3_0_0,
+		V4_3_1_0,
 	}
-	MinVersion     = V0_8_2_0
-	MaxVersion     = V4_0_0_0
-	DefaultVersion = V2_1_0_0
+	MinVersion = V0_8_2_0
+	MaxVersion = V4_3_1_0
+	// DefaultVersion is 2.8 as Sarama has full protocol coverage for that version
+	DefaultVersion = V2_8_0_0
 )
 
 var (

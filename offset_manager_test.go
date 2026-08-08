@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func initOffsetManagerWithBackoffFunc(
@@ -112,7 +115,7 @@ func TestNewOffsetManager(t *testing.T) {
 // Test that the correct sequence of offset commit messages is sent to a broker when
 // multiple goroutines for a group are committing offsets at the same time
 func TestOffsetManagerCommitSequence(t *testing.T) {
-	lastOffset := map[int32]int64{}
+	lastOffset := make(map[int32]int64)
 	var outOfOrder atomic.Pointer[string]
 	seedBroker := NewMockBroker(t, 1)
 	defer seedBroker.Close()
@@ -185,26 +188,158 @@ func TestOffsetManagerCommitSequence(t *testing.T) {
 	const commitsPerPartition = 1000
 
 	var wg sync.WaitGroup
-	for p := 0; p < numPartitions; p++ {
+	for p := range numPartitions {
 		pom, err := om.ManagePartition("topic", int32(p))
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		wg.Add(1)
-		go func() {
-			for c := 0; c < commitsPerPartition; c++ {
+		wg.Go(func() {
+			for c := range commitsPerPartition {
 				pom.MarkOffset(int64(c+1), "")
 				om.Commit()
 			}
-			wg.Done()
-		}()
+		})
 	}
 
 	wg.Wait()
 	errMsg := outOfOrder.Load()
 	if errMsg != nil {
 		t.Error(*errMsg)
+	}
+}
+
+// Test that concurrent Commit() calls do not deadlock when the coordinator
+// returns errors that trigger releaseCoordinator while other goroutines are
+// in constructRequest or coordinator(). This reproduces the lock ordering
+// issue from https://github.com/IBM/sarama/issues/3191 where four goroutines
+// form a cycle: broker.lock -> pomsLock -> brokerLock -> broker.lock.
+func TestOffsetManagerCommitConcurrentDeadlock(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	coordinatorBroker := NewMockBroker(t, 2)
+	defer coordinatorBroker.Close()
+
+	findCoordDelay := 500 * time.Microsecond
+	seedBroker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": func(req *request) encoderWithHeader {
+			resp := new(MetadataResponse)
+			resp.AddBroker(coordinatorBroker.Addr(), coordinatorBroker.BrokerID())
+			return resp
+		},
+		"FindCoordinatorRequest": func(req *request) encoderWithHeader {
+			// slow coordinator lookup increases the window where brokerLock
+			// is held in coordinator(), while LeastLoadedBroker calls
+			// ResponseSize (which needs broker.lock), widening the
+			// deadlock window
+			time.Sleep(findCoordDelay)
+			resp := new(FindCoordinatorResponse)
+			resp.Coordinator = &Broker{id: coordinatorBroker.brokerID, addr: coordinatorBroker.Addr()}
+			return resp
+		},
+	})
+
+	var commitCount atomic.Int64
+	coordinatorBroker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"ConsumerMetadataRequest": func(req *request) encoderWithHeader {
+			return &ConsumerMetadataResponse{
+				CoordinatorID:   coordinatorBroker.BrokerID(),
+				CoordinatorHost: "127.0.0.1",
+				CoordinatorPort: coordinatorBroker.Port(),
+			}
+		},
+		"FindCoordinatorRequest": func(req *request) encoderWithHeader {
+			time.Sleep(findCoordDelay)
+			resp := new(FindCoordinatorResponse)
+			resp.Coordinator = &Broker{id: coordinatorBroker.brokerID, addr: coordinatorBroker.Addr()}
+			return resp
+		},
+		"OffsetFetchRequest": func(r *request) encoderWithHeader {
+			req := r.body.(*OffsetFetchRequest)
+			resp := new(OffsetFetchResponse)
+			resp.Blocks = map[string]map[int32]*OffsetFetchResponseBlock{}
+			for topic, partitions := range req.partitions {
+				for _, partition := range partitions {
+					if _, ok := resp.Blocks[topic]; !ok {
+						resp.Blocks[topic] = map[int32]*OffsetFetchResponseBlock{}
+					}
+					resp.Blocks[topic][partition] = &OffsetFetchResponseBlock{
+						Offset: 0,
+						Err:    ErrNoError,
+					}
+				}
+			}
+			return resp
+		},
+		"OffsetCommitRequest": func(r *request) encoderWithHeader {
+			req := r.body.(*OffsetCommitRequest)
+			runtime.Gosched()
+			resp := new(OffsetCommitResponse)
+			resp.Errors = map[string]map[int32]KError{}
+
+			// always return ErrNotCoordinatorForConsumer to trigger
+			// releaseCoordinator in handleResponse, which acquires
+			// brokerLock while holding pomsLock, creating the conditions
+			// for the four-goroutine deadlock cycle
+			commitCount.Add(1)
+			for topic, partitions := range req.blocks {
+				resp.Errors[topic] = map[int32]KError{}
+				for partition := range partitions {
+					resp.Errors[topic][partition] = ErrNotCoordinatorForConsumer
+				}
+			}
+			return resp
+		},
+	})
+
+	config := NewTestConfig()
+	config.Consumer.Offsets.AutoCommit.Enable = false
+	config.Version = V0_9_0_0
+
+	testClient, err := NewClient([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, testClient)
+
+	om, err := NewOffsetManagerFromClient("group", testClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, om)
+
+	const numPartitions = 4
+	const commitsPerGoroutine = 200
+	poms := make([]PartitionOffsetManager, numPartitions)
+	for p := range numPartitions {
+		pom, err := om.ManagePartition("topic", int32(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		poms[p] = pom
+	}
+
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for p := range numPartitions {
+			pom := poms[p]
+			wg.Go(func() {
+				for c := range commitsPerGoroutine {
+					pom.MarkOffset(int64(c+1), "")
+					om.Commit()
+				}
+			})
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock detected: concurrent Commit() calls did not complete within timeout")
 	}
 }
 
@@ -233,7 +368,6 @@ var offsetsautocommitTestTable = []struct {
 func TestNewOffsetManagerOffsetsAutoCommit(t *testing.T) {
 	// Tests to validate configuration of `Consumer.Offsets.AutoCommit.Enable`
 	for _, tt := range offsetsautocommitTestTable {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			config := NewTestConfig()
 			if tt.set {
@@ -385,9 +519,9 @@ func TestOffsetManagerFetchInitialFail(t *testing.T) {
 
 // Test fetchInitialOffset retry on ErrOffsetsLoadInProgress
 func TestOffsetManagerFetchInitialLoadInProgress(t *testing.T) {
-	retryCount := int32(0)
+	var retryCount atomic.Int32
 	backoff := func(retries, maxRetries int) time.Duration {
-		atomic.AddInt32(&retryCount, 1)
+		retryCount.Add(1)
 		return 0
 	}
 	om, testClient, broker, coordinator := initOffsetManagerWithBackoffFunc(t, 0, backoff, NewTestConfig())
@@ -421,9 +555,66 @@ func TestOffsetManagerFetchInitialLoadInProgress(t *testing.T) {
 	safeClose(t, om)
 	safeClose(t, testClient)
 
-	if atomic.LoadInt32(&retryCount) == 0 {
+	if retryCount.Load() == 0 {
 		t.Fatal("Expected at least one retry")
 	}
+}
+
+// fetchInitialOffset must retry when OffsetFetchResponse v2+ surfaces a
+// retriable coordinator error at the top level with no per-partition blocks
+func TestOffsetManagerFetchInitialTopLevelErr(t *testing.T) {
+	config := NewTestConfig()
+	config.Metadata.Retry.Max = 1
+	config.Consumer.Offsets.AutoCommit.Interval = 1 * time.Millisecond
+	// V0_10_2_0 is the first version that negotiates OffsetFetch v2,
+	// which carries a top-level error code
+	config.Version = V0_10_2_0
+
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+	coordinator := NewMockBroker(t, 2)
+	defer coordinator.Close()
+
+	seedMeta := new(MetadataResponse)
+	seedMeta.AddBroker(coordinator.Addr(), coordinator.BrokerID())
+	seedMeta.AddTopicPartition("my_topic", 0, 1, []int32{}, []int32{}, []int32{}, ErrNoError)
+	broker.Returns(seedMeta)
+
+	testClient, err := NewClient([]string{broker.Addr()}, config)
+	require.NoError(t, err)
+
+	coordinator.Returns(&ConsumerMetadataResponse{
+		CoordinatorID:   coordinator.BrokerID(),
+		CoordinatorHost: "127.0.0.1",
+		CoordinatorPort: coordinator.Port(),
+	})
+
+	om, err := NewOffsetManagerFromClient("group", testClient)
+	require.NoError(t, err)
+
+	// first OffsetFetch reports NOT_COORDINATOR at the top level with no blocks
+	coordinator.Returns(&OffsetFetchResponse{Version: 2, Err: ErrNotCoordinatorForConsumer})
+
+	newCoordinator := NewMockBroker(t, 3)
+	defer newCoordinator.Close()
+	coordinator.Returns(&ConsumerMetadataResponse{
+		CoordinatorID:   newCoordinator.BrokerID(),
+		CoordinatorHost: "127.0.0.1",
+		CoordinatorPort: newCoordinator.Port(),
+	})
+
+	okResp := &OffsetFetchResponse{Version: 2}
+	okResp.AddBlock("my_topic", 0, &OffsetFetchResponseBlock{
+		Err: ErrNoError, Offset: 5, Metadata: "test_meta",
+	})
+	newCoordinator.Returns(okResp)
+
+	pom, err := om.ManagePartition("my_topic", 0)
+	require.NoError(t, err)
+
+	safeClose(t, pom)
+	safeClose(t, om)
+	safeClose(t, testClient)
 }
 
 func TestPartitionOffsetManagerInitialOffset(t *testing.T) {
@@ -712,9 +903,9 @@ func TestConstructRequestRetentionTime(t *testing.T) {
 		for _, retention := range []time.Duration{0, time.Millisecond} {
 			name := fmt.Sprintf("version %s retention: %s", version, retention)
 			t.Run(name, func(t *testing.T) {
-				// Perform necessary setup for calling the constructRequest() method. This
-				// test-case only cares about the code path that sets the retention time
-				// field in the returned request struct.
+				// Perform necessary setup for calling the constructRequestFor() method.
+				// This test-case only cares about the code path that sets the retention
+				// time field in the returned request struct.
 				conf := NewTestConfig()
 				conf.Version = version
 				conf.Consumer.Offsets.Retention = retention
@@ -729,7 +920,7 @@ func TestConstructRequestRetentionTime(t *testing.T) {
 					},
 				}
 
-				req := om.constructRequest()
+				req := om.constructRequestFor(nil)
 
 				expectedRetention := expectedRetention(version, retention)
 				if req.RetentionTime != expectedRetention {
@@ -738,4 +929,249 @@ func TestConstructRequestRetentionTime(t *testing.T) {
 			})
 		}
 	}
+}
+
+// offsetCommitCapture records every OffsetCommitRequest it sees before
+// delegating to the wrapped response.
+type offsetCommitCapture struct {
+	inner MockResponse
+	mu    sync.Mutex
+	reqs  []*OffsetCommitRequest
+}
+
+func (c *offsetCommitCapture) For(reqBody versionedDecoder) encoderWithHeader {
+	req := reqBody.(*OffsetCommitRequest)
+	c.mu.Lock()
+	c.reqs = append(c.reqs, req)
+	c.mu.Unlock()
+	return c.inner.For(reqBody)
+}
+
+func (c *offsetCommitCapture) requests() []*OffsetCommitRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.reqs)
+}
+
+func initHandledOffsetManager(t *testing.T, config *Config, commit MockResponse) (*offsetManager, Client, *MockBroker) {
+	t.Helper()
+	config.Version = V2_0_0_0
+
+	broker := NewMockBroker(t, 1)
+	metadata := NewMockMetadataResponse(t).SetBroker(broker.Addr(), broker.BrokerID())
+	offsetFetch := NewMockOffsetFetchResponse(t).SetError(ErrNoError)
+	for p := int32(0); p < 4; p++ {
+		metadata = metadata.SetLeader("my_topic", p, broker.BrokerID())
+		offsetFetch = offsetFetch.SetOffset("group", "my_topic", p, 5, "", ErrNoError)
+	}
+	broker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest":        metadata,
+		"FindCoordinatorRequest": NewMockFindCoordinatorResponse(t).SetCoordinator(CoordinatorGroup, "group", broker),
+		"OffsetFetchRequest":     offsetFetch,
+		"OffsetCommitRequest":    commit,
+	})
+
+	client, err := NewClient([]string{broker.Addr()}, config)
+	require.NoError(t, err)
+
+	om, err := newOffsetManagerFromClient("group", "member", 1, client, nil)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		safeClose(t, om)
+		safeClose(t, client)
+		broker.Close()
+	})
+	return om, client, broker
+}
+
+// newCapturingOffsetManager builds an offset manager whose commit requests are
+// recorded in the returned capture.
+func newCapturingOffsetManager(t *testing.T, autoCommit bool) (*offsetManager, *offsetCommitCapture) {
+	t.Helper()
+	config := NewTestConfig()
+	config.Consumer.Offsets.AutoCommit.Enable = autoCommit
+	capture := &offsetCommitCapture{inner: NewMockOffsetCommitResponse(t)}
+	om, _, _ := initHandledOffsetManager(t, config, capture)
+	return om, capture
+}
+
+func TestOffsetManagerRemovePartitions(t *testing.T) {
+	t.Run("commits marked offsets and stops managing the partitions", func(t *testing.T) {
+		om, capture := newCapturingOffsetManager(t, true)
+
+		poms := map[int32]PartitionOffsetManager{}
+		for p := int32(0); p < 4; p++ {
+			pom, err := om.ManagePartition("my_topic", p)
+			require.NoError(t, err)
+			pom.MarkOffset(int64(100+p), "")
+			poms[p] = pom
+		}
+
+		om.removePartitions(map[string][]int32{"my_topic": {2, 3}})
+
+		var committed []int32
+		for _, req := range capture.requests() {
+			for p := range req.blocks["my_topic"] {
+				committed = append(committed, p)
+			}
+		}
+		require.ElementsMatch(t, []int32{2,3}, committed)
+
+		require.Nil(t, om.findPOM("my_topic", 2))
+		require.Nil(t, om.findPOM("my_topic", 3))
+		require.NotNil(t, om.findPOM("my_topic", 0))
+		require.NotNil(t, om.findPOM("my_topic", 1))
+
+		_, open := <-poms[2].Errors()
+		require.False(t, open)
+	})
+
+	t.Run("does not commit marked offsets when auto-commit is disabled", func(t *testing.T) {
+		om, capture := newCapturingOffsetManager(t, false)
+
+		poms := map[int32]PartitionOffsetManager{}
+		for p := int32(0); p < 2; p++ {
+			pom, err := om.ManagePartition("my_topic", p)
+			require.NoError(t, err)
+			pom.MarkOffset(int64(100+p), "")
+			poms[p] = pom
+		}
+
+		om.removePartitions(map[string][]int32{"my_topic": {1}})
+
+		require.Empty(t, capture.requests())
+		require.Nil(t, om.findPOM("my_topic", 1))
+		require.NotNil(t, om.findPOM("my_topic", 0))
+		_, open := <-poms[1].Errors()
+		require.False(t, open)
+	})
+
+	t.Run("ignores partitions that are not managed", func(t *testing.T) {
+		om, _ := newCapturingOffsetManager(t, false)
+
+		_, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+
+		om.removePartitions(map[string][]int32{"my_topic": {3}, "other_topic": {0}})
+		require.NotNil(t, om.findPOM("my_topic", 0))
+	})
+
+	// send-on-closed-channel safety when a commit runs concurrently with removePartitions (#2608)
+	t.Run("is safe against a concurrent commit", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Offsets.AutoCommit.Enable = false
+		config.Consumer.Offsets.Retry.Max = 0
+		config.Consumer.Return.Errors = true
+
+		commit := NewMockOffsetCommitResponse(t)
+		for p := int32(0); p < 4; p++ {
+			commit = commit.SetError("group", "my_topic", p, ErrOffsetMetadataTooLarge)
+		}
+		om, _, _ := initHandledOffsetManager(t, config, commit)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				om.Commit()
+			}
+		}()
+
+		for i := 0; i < 120; i++ {
+			p := int32(i % 4)
+			pom, err := om.ManagePartition("my_topic", p)
+			require.NoError(t, err)
+			go func() {
+				for range pom.Errors() {
+				}
+			}()
+			pom.MarkOffset(int64(100+i), "")
+			om.removePartitions(map[string][]int32{"my_topic": {p}})
+		}
+		wg.Wait()
+	})
+}
+
+func TestOffsetManagerSetGeneration(t *testing.T) {
+	t.Run("commits carry the generation most recently set", func(t *testing.T) {
+		om, capture := newCapturingOffsetManager(t, false)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+
+		pom.MarkOffset(100, "")
+		om.Commit()
+		om.setGeneration(7)
+		pom.MarkOffset(101, "")
+		om.Commit()
+
+		reqs := capture.requests()
+		require.NotEmpty(t, reqs)
+		require.Equal(t, int32(1), reqs[0].ConsumerGroupGeneration)
+		require.Equal(t, int32(7), reqs[len(reqs)-1].ConsumerGroupGeneration)
+	})
+
+	t.Run("waits for an in-flight commit to finish", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Offsets.AutoCommit.Enable = false
+		capture := &offsetCommitCapture{inner: NewMockOffsetCommitResponse(t)}
+		gate := &gatedResponse{inner: capture, entered: make(chan none), release: make(chan none)}
+		om, _, _ := initHandledOffsetManager(t, config, gate)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		pom.MarkOffset(100, "")
+
+		commitDone := make(chan none)
+		go func() {
+			om.Commit()
+			close(commitDone)
+		}()
+		<-gate.entered
+
+		genDone := make(chan none)
+		go func() {
+			om.setGeneration(7)
+			close(genDone)
+		}()
+		require.Never(t, func() bool {
+			select {
+			case <-genDone:
+				return true
+			default:
+				return false
+			}
+		}, 150*time.Millisecond, 20*time.Millisecond)
+
+		close(gate.release)
+		<-commitDone
+		<-genDone
+
+		pom.MarkOffset(101, "")
+		om.Commit()
+
+		reqs := capture.requests()
+		require.Equal(t, int32(1), reqs[0].ConsumerGroupGeneration)
+		require.Equal(t, int32(7), reqs[len(reqs)-1].ConsumerGroupGeneration)
+	})
+}
+
+// gatedResponse holds the first request in flight: it closes entered when that
+// request arrives, then blocks until release is closed. Later requests pass
+// straight through to the wrapped response.
+type gatedResponse struct {
+	inner   MockResponse
+	once    sync.Once
+	entered chan none
+	release chan none
+}
+
+func (g *gatedResponse) For(reqBody versionedDecoder) encoderWithHeader {
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+	return g.inner.For(reqBody)
 }

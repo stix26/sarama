@@ -2,7 +2,11 @@
 
 package sarama
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 var (
 	// The v0 metadata request has a non-nullable array of topic names
@@ -109,6 +113,47 @@ var (
 	metadataRequestAutoCreateClusterAuthTopicAuthV10 = []byte{
 		3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 't', 'o', 'p', 'i', 'c', '1',
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 't', 'o', 'p', 'i', 'c', '2', 0, 1, 1, 1, 0,
+	}
+
+	// v11 drops the IncludeClusterAuthorizedOperations request field (KIP-700);
+	// it is now exposed by the DescribeCluster API.
+	metadataRequestNoTopicsV11 = []byte{
+		0x00, // Topics (null)
+		0x00, // AllowAutoTopicCreation
+		0x00, // IncludeTopicAuthorizedOperations
+		0x00, // tagged fields
+	}
+
+	metadataRequestTwoTopicsV11 = []byte{
+		0x03, // Topics length
+		// topic1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // TopicId
+		0x07, 't', 'o', 'p', 'i', 'c', '1', // Name
+		0x00, // tagged fields
+		// topic2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // TopicId
+		0x07, 't', 'o', 'p', 'i', 'c', '2', // Name
+		0x00, // tagged fields
+
+		0x00, // AllowAutoTopicCreation
+		0x00, // IncludeTopicAuthorizedOperations
+		0x00, // tagged fields
+	}
+
+	metadataRequestAutoCreateTopicAuthV11 = []byte{
+		0x03, // Topics length
+		// topic1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // TopicId
+		0x07, 't', 'o', 'p', 'i', 'c', '1', // Name
+		0x00, // tagged fields
+		// topic2
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // TopicId
+		0x07, 't', 'o', 'p', 'i', 'c', '2', // Name
+		0x00, // tagged fields
+
+		0x01, // AllowAutoTopicCreation
+		0x01, // IncludeTopicAuthorizedOperations
+		0x00, // tagged fields
 	}
 )
 
@@ -259,4 +304,34 @@ func TestMetadataRequestV10(t *testing.T) {
 	request.IncludeClusterAuthorizedOperations = true
 	request.IncludeTopicAuthorizedOperations = true
 	testRequest(t, "one topic, auto create, cluster auth, topic auth", request, metadataRequestAutoCreateClusterAuthTopicAuthV10)
+}
+
+func TestMetadataRequestV11(t *testing.T) {
+	request := new(MetadataRequest)
+	request.Version = 11
+	testRequest(t, "no topics", request, metadataRequestNoTopicsV11)
+
+	request.Topics = []string{"topic1", "topic2"}
+	testRequest(t, "two topics", request, metadataRequestTwoTopicsV11)
+
+	request.AllowAutoTopicCreation = true
+	request.IncludeTopicAuthorizedOperations = true
+	testRequest(t, "two topics, auto create, topic auth", request, metadataRequestAutoCreateTopicAuthV11)
+}
+
+func TestNewMetadataRequest(t *testing.T) {
+	// NewMetadataRequest and requiredVersion map between KafkaVersion and protocol
+	// version in opposite directions and must stay consistent: configuring the
+	// client at a protocol version's requiredVersion must select at least that version
+	r := &MetadataRequest{}
+	for v := int16(0); ; v++ {
+		r.Version = v
+		if !r.isValidVersion() {
+			break
+		}
+		got := NewMetadataRequest(r.requiredVersion(), nil).Version
+		assert.GreaterOrEqualf(t, got, v,
+			"NewMetadataRequest(%s) selected v%d, below v%d which requires it",
+			r.requiredVersion(), got, v)
+	}
 }

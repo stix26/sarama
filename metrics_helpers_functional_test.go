@@ -8,8 +8,6 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
-// Additional metric validator helpers used only in functional tests.
-
 func (m *metricValidators) registerForGlobalAndTopic(topic string, validator *metricValidator) {
 	m.register(&metricValidator{validator.name, validator.validator})
 	m.register(&metricValidator{getMetricNameForTopic(validator.name, topic), validator.validator})

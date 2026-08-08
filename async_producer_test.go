@@ -15,10 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fortytw2/leaktest"
-	"github.com/rcrowley/go-metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 )
 
 func expectResultsWithTimeout(t *testing.T, p AsyncProducer, successCount, errorCount int, timeout time.Duration) {
@@ -59,6 +58,49 @@ func expectResultsWithTimeout(t *testing.T, p AsyncProducer, successCount, error
 
 func expectResults(t *testing.T, p AsyncProducer, successCount, errorCount int) {
 	expectResultsWithTimeout(t, p, successCount, errorCount, 5*time.Minute)
+}
+
+func TestPartitionProducerFlushRetryBuffersAssignsSequence(t *testing.T) {
+	cfg := NewTestConfig()
+	cfg.Producer.Idempotent = true
+
+	txnmgr := &transactionManager{
+		producerID:      1,
+		producerEpoch:   0,
+		sequenceNumbers: map[string]int32{"topic-0": 1},
+	}
+
+	parent := &asyncProducer{
+		conf:   cfg,
+		txnmgr: txnmgr,
+	}
+
+	bp := &brokerProducer{
+		input: make(chan *ProducerMessage, 1),
+	}
+
+	pp := &partitionProducer{
+		parent:         parent,
+		topic:          "topic",
+		partition:      0,
+		brokerProducer: bp,
+		retryState:     make([]partitionRetryState, 1),
+		highWatermark:  1,
+	}
+
+	msg := &ProducerMessage{Topic: "topic", Partition: 0}
+	pp.retryState[0].buf = []*ProducerMessage{msg}
+
+	pp.flushRetryBuffers()
+
+	select {
+	case flushed := <-bp.input:
+		require.True(t, flushed.hasSequence, "message should have a sequence assigned")
+		require.Equal(t, int32(1), flushed.sequenceNumber, "sequence number should have increased")
+		require.Equal(t, txnmgr.producerEpoch, flushed.producerEpoch, "producer epoch should be the same")
+	default:
+		t.Fatal("expected buffered message to flush")
+	}
 }
 
 type testPartitioner chan *int32
@@ -114,10 +156,10 @@ func TestAsyncProducer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Metadata: i}
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		select {
 		case msg := <-producer.Errors():
 			t.Error(msg.Err)
@@ -165,8 +207,8 @@ func TestAsyncProducerMultipleFlushes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for flush := 0; flush < 3; flush++ {
-		for i := 0; i < 5; i++ {
+	for range 3 {
+		for range 5 {
 			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 		}
 		expectResults(t, producer, 5, 0)
@@ -206,7 +248,7 @@ func TestAsyncProducerMultipleBrokers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	expectResults(t, producer, 10, 0)
@@ -249,7 +291,7 @@ func TestAsyncProducerCustomPartitioner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	expectResults(t, producer, 2, 3)
@@ -279,7 +321,7 @@ func TestAsyncProducerFailureRetry(t *testing.T) {
 	}
 	seedBroker.Close()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	prodNotLeader := new(ProduceResponse)
@@ -297,7 +339,7 @@ func TestAsyncProducerFailureRetry(t *testing.T) {
 	expectResults(t, producer, 10, 0)
 	leader1.Close()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	leader2.Returns(prodSuccess)
@@ -417,7 +459,7 @@ func TestAsyncProducerEncoderFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for flush := 0; flush < 3; flush++ {
+	for range 3 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: flakyEncoder(true), Value: flakyEncoder(false)}
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: flakyEncoder(false), Value: flakyEncoder(true)}
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: flakyEncoder(true), Value: flakyEncoder(true)}
@@ -492,7 +534,7 @@ func TestAsyncProducerBrokerBounceWithStaleMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	leader1.Close()                     // producer should get EOF
@@ -535,7 +577,7 @@ func TestAsyncProducerMultipleRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	prodNotLeader := new(ProduceResponse)
@@ -559,7 +601,7 @@ func TestAsyncProducerMultipleRetries(t *testing.T) {
 	leader2.Returns(prodSuccess)
 	expectResults(t, producer, 10, 0)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	leader2.Returns(prodSuccess)
@@ -586,9 +628,14 @@ func TestAsyncProducerMultipleRetriesWithBackoffFunc(t *testing.T) {
 	config.Producer.Return.Successes = true
 	config.Producer.Retry.Max = 4
 
-	backoffCalled := make([]int32, config.Producer.Retry.Max+1)
+	// We use a pointer to atomic to prevent the possibility of a reallocation causing a copy.
+	backoffCalled := make([]*atomic.Int32, config.Producer.Retry.Max+1)
+	for i := range backoffCalled {
+		backoffCalled[i] = new(atomic.Int32)
+	}
+
 	config.Producer.Retry.BackoffFunc = func(retries, maxRetries int) time.Duration {
-		atomic.AddInt32(&backoffCalled[retries-1], 1)
+		backoffCalled[retries-1].Add(1)
 		return 0
 	}
 	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
@@ -629,11 +676,11 @@ func TestAsyncProducerMultipleRetriesWithBackoffFunc(t *testing.T) {
 	closeProducer(t, producer)
 
 	for i := 0; i < config.Producer.Retry.Max; i++ {
-		if atomic.LoadInt32(&backoffCalled[i]) != 1 {
+		if backoffCalled[i].Load() != 1 {
 			t.Errorf("expected one retry attempt #%d", i)
 		}
 	}
-	if atomic.LoadInt32(&backoffCalled[config.Producer.Retry.Max]) != 0 {
+	if backoffCalled[config.Producer.Retry.Max].Load() != 0 {
 		t.Errorf("expected no retry attempt #%d", config.Producer.Retry.Max)
 	}
 }
@@ -683,7 +730,7 @@ func TestAsyncProducerWithExponentialBackoffDurations(t *testing.T) {
 	broker.Returns(metadataResponse)
 	broker.Returns(successResponse)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		producer.Input() <- &ProducerMessage{Topic: topic, Value: StringEncoder("test")}
 	}
 
@@ -738,7 +785,7 @@ func TestAsyncProducerMultipleRetriesWithConcurrentRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -768,21 +815,21 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 	// The seed broker only handles Metadata request in bootstrap
 	seedBroker.setHandler(metadataRequestHandlerFunc)
 
-	var emptyValues int32 = 0
+	var emptyValues atomic.Int32
 
 	countRecordsWithEmptyValue := func(req *request) {
 		preq := req.body.(*ProduceRequest)
 		if batch := preq.records["my_topic"][0].RecordBatch; batch != nil {
 			for _, record := range batch.Records {
 				if len(record.Value) == 0 {
-					atomic.AddInt32(&emptyValues, 1)
+					emptyValues.Add(1)
 				}
 			}
 		}
 		if batch := preq.records["my_topic"][0].MsgSet; batch != nil {
 			for _, record := range batch.Messages {
 				if len(record.Msg.Value) == 0 {
-					atomic.AddInt32(&emptyValues, 1)
+					emptyValues.Add(1)
 				}
 			}
 		}
@@ -827,7 +874,7 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 
 	pushMsg := func() {
 		defer wg.Done()
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 			time.Sleep(50 * time.Millisecond)
 		}
@@ -836,7 +883,7 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 	wg.Add(1)
 	go pushMsg()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		time.Sleep(100 * time.Millisecond)
 
 		wg.Add(1)
@@ -861,7 +908,7 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 
 	closeProducerWithTimeout(t, producer, 5*time.Second)
 
-	if emptyValues := atomic.LoadInt32(&emptyValues); emptyValues > 0 {
+	if emptyValues := emptyValues.Load(); emptyValues > 0 {
 		t.Fatalf("%d empty values", emptyValues)
 	}
 }
@@ -887,7 +934,7 @@ func TestAsyncProducerOutOfRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -895,7 +942,7 @@ func TestAsyncProducerOutOfRetries(t *testing.T) {
 	prodNotLeader.AddTopicPartition("my_topic", 0, ErrNotLeaderForPartition)
 	leader.Returns(prodNotLeader)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case msg := <-producer.Errors():
 			if !errors.Is(msg.Err, ErrNotLeaderForPartition) {
@@ -908,7 +955,7 @@ func TestAsyncProducerOutOfRetries(t *testing.T) {
 
 	seedBroker.Returns(metadataResponse)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -1002,8 +1049,8 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 	}
 
 	// prime partitions
-	for p := int32(0); p < 2; p++ {
-		for i := 0; i < 5; i++ {
+	for p := range int32(2) {
+		for range 5 {
 			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: p}
 		}
 		prodSuccess := new(ProduceResponse)
@@ -1013,7 +1060,7 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 	}
 
 	// send more messages on partition 0
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 0}
 	}
 	prodNotLeader := new(ProduceResponse)
@@ -1032,7 +1079,7 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 	expectResults(t, producer, 5, 0)
 
 	// put five more through
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 0}
 	}
 	prodSuccess = new(ProduceResponse)
@@ -1064,7 +1111,7 @@ func TestAsyncProducerRetryShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 	producer.AsyncClose()
@@ -1114,7 +1161,7 @@ func TestAsyncProducerNoReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -1167,7 +1214,7 @@ func TestAsyncProducerIdempotentGoldenPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -1312,12 +1359,12 @@ func TestAsyncProducerIdempotentRetryCheckBatch(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 		}
 
 		go func() {
-			for i := 0; i < 7; i++ {
+			for range 7 {
 				producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder("goroutine")}
 				time.Sleep(100 * time.Millisecond)
 			}
@@ -1381,12 +1428,12 @@ func TestAsyncProducerIdempotentRetryCheckBatch_2378(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
 	go func() {
-		for i := 0; i < 7; i++ {
+		for range 7 {
 			producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder("goroutine")}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -1397,6 +1444,73 @@ func TestAsyncProducerIdempotentRetryCheckBatch_2378(t *testing.T) {
 
 	broker.Close()
 	closeProducer(t, producer)
+}
+
+// test case for https://github.com/IBM/sarama/issues/2469: idempotent producer
+// retries via retryBatch must honor Retry.Backoff / Retry.BackoffFunc when the
+// broker repeatedly returns a retriable error.
+func TestAsyncProducerIdempotentRetryBatchBackoff(t *testing.T) {
+	broker := NewMockBroker(t, 1)
+
+	metadataResponse := &MetadataResponse{
+		Version:      4,
+		ControllerID: 1,
+	}
+	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
+	metadataResponse.AddTopicPartition("my_topic", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+
+	initProducerIDResponse := &InitProducerIDResponse{
+		ThrottleTime:  0,
+		ProducerID:    1000,
+		ProducerEpoch: 1,
+	}
+
+	prodNotLeaderResponse := &ProduceResponse{
+		Version:      3,
+		ThrottleTime: 0,
+	}
+	prodNotLeaderResponse.AddTopicPartition("my_topic", 0, ErrNotEnoughReplicas)
+
+	handler := func(req *request) (res encoderWithHeader) {
+		switch req.body.key() {
+		case 3:
+			return metadataResponse
+		case 22:
+			return initProducerIDResponse
+		case 0:
+			return prodNotLeaderResponse
+		}
+		return nil
+	}
+
+	config := NewTestConfig()
+	config.Version = V0_11_0_0
+	config.Producer.Idempotent = true
+	config.Net.MaxOpenRequests = 1
+	config.Producer.Retry.Max = 3
+	config.Producer.RequiredAcks = WaitForAll
+	config.Producer.Return.Successes = true
+	config.Producer.Flush.Frequency = 50 * time.Millisecond
+
+	backoffCalls := new(atomic.Int32)
+	config.Producer.Retry.BackoffFunc = func(retries, maxRetries int) time.Duration {
+		backoffCalls.Add(1)
+		return 0
+	}
+
+	broker.setHandler(handler)
+	producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
+	require.NoError(t, err)
+
+	producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
+
+	expectResults(t, producer, 0, 1)
+
+	broker.Close()
+	closeProducer(t, producer)
+
+	assert.GreaterOrEqual(t, int(backoffCalls.Load()), config.Producer.Retry.Max,
+		"BackoffFunc should be called at least Retry.Max times during idempotent retryBatch")
 }
 
 func TestAsyncProducerIdempotentErrorOnOutOfSeq(t *testing.T) {
@@ -1432,7 +1546,7 @@ func TestAsyncProducerIdempotentErrorOnOutOfSeq(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -1599,11 +1713,10 @@ func TestAsyncProducerIdempotentEpochExhaustion(t *testing.T) {
 //
 //nolint:paralleltest
 func TestBrokerProducerShutdown(t *testing.T) {
-	defer leaktest.Check(t)()
-	metrics.UseNilMetrics = true // disable Sarama's go-metrics library
-	defer func() {
-		metrics.UseNilMetrics = false
-	}()
+	defer goleak.VerifyNone(t,
+		goleak.IgnoreCurrent(),
+		goleak.IgnoreTopFunction("github.com/rcrowley/go-metrics.(*meterArbiter).tick"),
+	)
 
 	mockBroker := NewMockBroker(t, 1)
 	metadataResponse := &MetadataResponse{}
@@ -1629,6 +1742,537 @@ func TestBrokerProducerShutdown(t *testing.T) {
 	mockBroker.Close()
 }
 
+// TestBrokerProducerWaitForSpaceEmptyBufferRollover ensures forced rollovers with an empty buffer
+// do not deadlock waiting for responses when no partitions are muted.
+func TestBrokerProducerWaitForSpaceEmptyBufferRollover(t *testing.T) {
+	config := NewTestConfig()
+	parent := &asyncProducer{
+		conf:   config,
+		muter:  newPartitionMuter(),
+		txnmgr: &transactionManager{},
+	}
+
+	bp := &brokerProducer{
+		parent:            parent,
+		accumulatingBatch: newProduceSet(parent),
+		output:            make(chan *produceSet, 1),
+		responses:         make(chan *brokerProducerResponse),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bp.waitForSpace(&ProducerMessage{Topic: "topic", Partition: 0}, true)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForSpace blocked on empty buffer rollover")
+	}
+}
+
+func awaitMuterBlocked(t *testing.T, m *partitionMuter, set *produceSet) {
+	t.Helper()
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		assert.True(c, m.isAnyMuted(set), "muter is not blocked on set")
+	}, 500*time.Millisecond, 5*time.Millisecond)
+}
+
+func assertNotDone[T any](t *testing.T, ch <-chan T, wait time.Duration) {
+	t.Helper()
+	time.Sleep(wait)
+	select {
+	case <-ch:
+		t.Fatal("channel should not be ready")
+	default:
+	}
+}
+
+func assertDoneWithin[T any](t *testing.T, ch <-chan T, timeout time.Duration) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for channel")
+		var zero T
+		return zero
+	}
+}
+
+// TestBrokerProducerWaitForSpaceRespectsExternalUnmute ensures waitForSpace does not
+// deadlock when partitions are muted by another producer and are unmuted elsewhere.
+func TestBrokerProducerWaitForSpaceRespectsExternalUnmute(t *testing.T) {
+	config := NewTestConfig()
+	txnMgr := &transactionManager{
+		producerID:      0,
+		producerEpoch:   0,
+		sequenceNumbers: make(map[string]int32),
+	}
+	parent := &asyncProducer{
+		conf:   config,
+		muter:  newPartitionMuter(),
+		txnmgr: txnMgr,
+	}
+
+	externallyMutedSet := newProduceSet(parent)
+	safeAddMessage(t, externallyMutedSet, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("held")})
+	if !parent.muter.tryMute(externallyMutedSet) {
+		t.Fatal("expected to mute partition")
+	}
+
+	output := make(chan *produceSet, 1)
+	bp := &brokerProducer{
+		parent:            parent,
+		accumulatingBatch: newProduceSet(parent),
+		output:            output,
+		responses:         make(chan *brokerProducerResponse),
+	}
+	msg := &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("wait")}
+	safeAddMessage(t, bp.accumulatingBatch, msg)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bp.waitForSpace(msg, true)
+	}()
+
+	awaitMuterBlocked(t, parent.muter, bp.accumulatingBatch)
+	parent.muter.unmute(externallyMutedSet)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForSpace blocked waiting for external unmute")
+	}
+}
+
+func TestBrokerProducerTryBuildFlushingBatch(t *testing.T) {
+	newTestBrokerProducer := func() *brokerProducer {
+		parent := &asyncProducer{
+			conf:   NewTestConfig(),
+			muter:  newPartitionMuter(),
+			txnmgr: &transactionManager{},
+		}
+		return &brokerProducer{
+			parent:            parent,
+			accumulatingBatch: newProduceSet(parent),
+		}
+	}
+
+	t.Run("signals when a batch stranded behind a muted partition can be retried", func(t *testing.T) {
+		bp := newTestBrokerProducer()
+		safeAddMessage(t, bp.accumulatingBatch, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("stranded")})
+
+		inFlightBatch := newProduceSet(bp.parent)
+		safeAddMessage(t, inFlightBatch, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retrying")})
+		require.True(t, bp.parent.muter.tryMute(inFlightBatch), "expected to mute partition")
+
+		unmuteSignal := bp.tryBuildFlushingBatch()
+		require.Nil(t, bp.flushingBatch, "expected the muted partition to remain buffered")
+		require.NotNil(t, unmuteSignal, "expected to await the muted partition")
+		select {
+		case <-unmuteSignal:
+			assert.Fail(t, "unmute signaled before the partition was unmuted")
+		default:
+		}
+
+		bp.parent.muter.unmute(inFlightBatch)
+		select {
+		case <-unmuteSignal:
+		default:
+			require.FailNow(t, "unmute was not signaled")
+		}
+
+		require.Nil(t, bp.tryBuildFlushingBatch(), "expected no unmute wait after building the batch")
+		require.NotNil(t, bp.flushingBatch, "expected to build the flushing batch")
+	})
+
+	t.Run("builds a partial batch from unmuted partitions", func(t *testing.T) {
+		bp := newTestBrokerProducer()
+		safeAddMessage(t, bp.accumulatingBatch, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("p0")})
+		safeAddMessage(t, bp.accumulatingBatch, &ProducerMessage{Topic: "topic", Partition: 1, Value: StringEncoder("p1")})
+
+		mutedBatch := newProduceSet(bp.parent)
+		safeAddMessage(t, mutedBatch, &ProducerMessage{Topic: "topic", Partition: 1, Value: StringEncoder("held")})
+		require.True(t, bp.parent.muter.tryMute(mutedBatch), "expected to mute partition")
+
+		require.Nil(t, bp.tryBuildFlushingBatch(), "expected no unmute wait after building a partial batch")
+		require.NotNil(t, bp.flushingBatch, "expected to flush available partitions")
+		assert.Contains(t, bp.flushingBatch.msgs["topic"], int32(0), "expected unmuted partition to flush")
+		assert.NotContains(t, bp.flushingBatch.msgs["topic"], int32(1), "expected muted partition to stay buffered")
+		assert.Contains(t, bp.accumulatingBatch.msgs["topic"], int32(1), "expected muted partition to remain buffered")
+	})
+}
+
+// TestAsyncProducerUnblocksOnExternalUnmute verifies that a batch stranded
+// behind a partition muted by another brokerProducer flushes once the mute is
+// released (#3689).
+func TestAsyncProducerUnblocksOnExternalUnmute(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	leader := NewMockBroker(t, 2)
+
+	metadataResponse := new(MetadataResponse)
+	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
+	metadataResponse.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, nil, ErrNoError)
+	seedBroker.Returns(metadataResponse)
+
+	prodSuccess := new(ProduceResponse)
+	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
+	leader.Returns(prodSuccess)
+
+	config := NewTestConfig()
+	config.Producer.Return.Successes = true
+	producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
+	require.NoError(t, err)
+
+	// mute the partition externally, as a retryBatch with a batch still in flight would
+	parent := producer.(*asyncProducer)
+	retryingBatch := newProduceSet(parent)
+	safeAddMessage(t, retryingBatch, &ProducerMessage{Topic: "my_topic", Partition: 0, Value: StringEncoder("in-flight")})
+	require.True(t, parent.muter.tryMute(retryingBatch), "expected to mute partition")
+
+	producer.Input() <- &ProducerMessage{Topic: "my_topic", Value: StringEncoder(TestMessage)}
+	assertNotDone(t, producer.Successes(), 100*time.Millisecond)
+
+	parent.muter.unmute(retryingBatch)
+	expectResultsWithTimeout(t, producer, 1, 0, 5*time.Second)
+
+	closeProducerWithTimeout(t, producer, 5*time.Second)
+	leader.Close()
+	seedBroker.Close()
+}
+
+// TestBrokerProducerWaitForSpaceAllPartitionsMuted verifies that waitForSpace unblocks
+// when all partitions in the accumulating batch are externally muted and later unmuted.
+func TestBrokerProducerWaitForSpaceAllPartitionsMuted(t *testing.T) {
+	config := NewTestConfig()
+	parent := &asyncProducer{
+		conf:   config,
+		muter:  newPartitionMuter(),
+		txnmgr: &transactionManager{},
+	}
+
+	blockedSet := newProduceSet(parent)
+	safeAddMessage(t, blockedSet, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("held")})
+	if !parent.muter.tryMute(blockedSet) {
+		t.Fatal("expected to mute partition externally")
+	}
+
+	bp := &brokerProducer{
+		parent:            parent,
+		accumulatingBatch: newProduceSet(parent),
+		output:            make(chan *produceSet, 1),
+		responses:         make(chan *brokerProducerResponse),
+		currentRetries:    make(map[string]map[int32]error),
+	}
+	safeAddMessage(t, bp.accumulatingBatch, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("waiting")})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bp.waitForSpace(&ProducerMessage{Topic: "topic", Partition: 0}, true)
+	}()
+
+	assertNotDone(t, done, 50*time.Millisecond)
+	parent.muter.unmute(blockedSet)
+	require.NoError(t, assertDoneWithin(t, done, 2*time.Second))
+}
+
+// TestPartitionMuterCloseWakesWaitUntilMuted verifies that closing the muter wakes
+// goroutines blocked in waitUntilMuted.
+func TestPartitionMuterCloseWakesWaitUntilMuted(t *testing.T) {
+	config := NewTestConfig()
+	parent := &asyncProducer{
+		conf:   config,
+		muter:  newPartitionMuter(),
+		txnmgr: &transactionManager{},
+	}
+
+	blockedSet := newProduceSet(parent)
+	safeAddMessage(t, blockedSet, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("held")})
+	if !parent.muter.tryMute(blockedSet) {
+		t.Fatal("expected to mute partition")
+	}
+
+	waitSet := newProduceSet(parent)
+	safeAddMessage(t, waitSet, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("waiting")})
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- parent.muter.waitUntilMuted(waitSet)
+	}()
+
+	assertNotDone(t, done, 50*time.Millisecond)
+	parent.muter.close()
+
+	select {
+	case result := <-done:
+		if result {
+			t.Fatal("expected waitUntilMuted to return false after close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+// TestBrokerProducerRollOverClearsTimer ensures timer events from a previous batch
+// do not cause a flush of a fresh empty batch after rollOver.
+func TestBrokerProducerRollOverClearsTimer(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	config := NewTestConfig()
+	config.Producer.Flush.Frequency = 10 * time.Millisecond
+	parent := &asyncProducer{
+		conf:   config,
+		muter:  newPartitionMuter(),
+		txnmgr: &transactionManager{},
+	}
+	output := make(chan *produceSet, 2)
+	responses := make(chan *brokerProducerResponse)
+	input := make(chan *ProducerMessage)
+	bp := &brokerProducer{
+		parent:            parent,
+		broker:            &Broker{id: 1},
+		input:             input,
+		output:            output,
+		responses:         responses,
+		accumulatingBatch: newProduceSet(parent),
+		currentRetries:    make(map[string]map[int32]error),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		bp.run()
+		close(done)
+	}()
+
+	msg := &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("v")}
+	input <- msg
+
+	select {
+	case first := <-output:
+		if first == nil || first.empty() {
+			t.Fatal("expected flushed batch to contain message")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected batch flush after timer fired")
+	}
+
+	select {
+	case <-output:
+		t.Fatal("unexpected flush after rollOver")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(responses)
+	close(input)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("brokerProducer did not shut down")
+	}
+}
+
+func TestRetryBatchRespectsPartitionMuter(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = true
+	txnMgr := &transactionManager{
+		producerID:      0,
+		producerEpoch:   0,
+		sequenceNumbers: make(map[string]int32),
+	}
+
+	parent := &asyncProducer{
+		conf:       config,
+		muter:      newPartitionMuter(),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		txnmgr:     txnMgr,
+	}
+	leader := &Broker{}
+	parent.client = &stubLeaderClient{leader: leader, cfg: config}
+
+	output := make(chan *produceSet, 1)
+	bp := &brokerProducer{
+		parent: parent,
+		broker: leader,
+		output: output,
+		input:  make(chan *ProducerMessage),
+	}
+	parent.brokers[leader] = bp
+
+	retrySet := newProduceSet(parent)
+	safeAddMessage(t, retrySet, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")})
+	retryPartitionSet := retrySet.msgs["topic"][0]
+	if !parent.muter.tryMute(retrySet) {
+		t.Fatal("expected retry set to mute partitions")
+	}
+	parent.muter.unmute(retrySet)
+
+	parent.retryBatch("topic", 0, retryPartitionSet, ErrNotEnoughReplicas, false)
+
+	select {
+	case sent := <-output:
+		set := sent.msgs["topic"][0]
+		require.Equal(t, retryPartitionSet, set)
+	default:
+		t.Fatal("expected retry batch to be dispatched")
+	}
+
+	contender := newProduceSet(parent)
+	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+	if parent.muter.tryMute(contender) {
+		t.Fatal("expected partition to remain muted by retry batch")
+	}
+}
+
+func TestRetryBatchReleasesMuteOnShutdown(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = false
+	config.Producer.Retry.Max = 1
+	config.Producer.Retry.Backoff = 0
+	config.Producer.Return.Errors = true
+
+	parent := &asyncProducer{
+		conf:       config,
+		muter:      newPartitionMuter(),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		errors:     make(chan *ProducerError, 1),
+		done:       make(chan struct{}),
+		txnmgr:     &transactionManager{},
+	}
+	leader := &Broker{id: 1}
+	parent.client = &stubLeaderClient{leader: leader, cfg: config}
+
+	// unbuffered and never read, so the handoff can only complete via shutdown
+	parent.brokers[leader] = &brokerProducer{
+		parent: parent,
+		broker: leader,
+		output: make(chan *produceSet),
+		input:  make(chan *ProducerMessage),
+	}
+
+	sent := newProduceSet(parent)
+	safeAddMessage(t, sent, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")})
+	retryPartitionSet := sent.msgs["topic"][0]
+	require.True(t, parent.muter.tryMute(sent), "sent batch should mute its partition")
+	parent.inFlight.Add(1)
+
+	done := make(chan struct{})
+	go func() {
+		parent.retryBatch("topic", 0, retryPartitionSet, ErrOutOfBrokers, true)
+		close(done)
+	}()
+
+	require.True(t, parent.closed.CompareAndSwap(false, true))
+	close(parent.done)
+
+	producerErr := assertDoneWithin(t, parent.errors, 2*time.Second)
+	require.Equal(t, ErrShuttingDown, producerErr.Err)
+	assertDoneWithin(t, done, 2*time.Second)
+
+	contender := newProduceSet(parent)
+	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+	require.True(t, parent.muter.tryMute(contender), "partition mute should be released after aborted handoff")
+	parent.muter.unmute(contender)
+}
+
+func TestBrokerProducerHandleError(t *testing.T) {
+	t.Run("keeps non-idempotent connection retries muted", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Producer.Idempotent = false
+		config.Producer.Retry.Max = 1
+		config.Producer.Retry.Backoff = 0
+
+		parent := &asyncProducer{
+			conf:       config,
+			muter:      newPartitionMuter(),
+			brokers:    make(map[*Broker]*brokerProducer),
+			brokerRefs: make(map[*brokerProducer]int),
+			retries:    make(chan *ProducerMessage, 4),
+			txnmgr:     &transactionManager{},
+		}
+		retryLeader := &Broker{id: 2}
+		parent.client = &stubLeaderClient{leader: retryLeader, cfg: config}
+
+		output := make(chan *produceSet, 1)
+		parent.brokers[retryLeader] = &brokerProducer{
+			parent: parent,
+			broker: retryLeader,
+			output: output,
+			input:  make(chan *ProducerMessage),
+		}
+
+		bp := &brokerProducer{
+			parent:            parent,
+			broker:            &Broker{id: 1},
+			input:             make(chan *ProducerMessage),
+			accumulatingBatch: newProduceSet(parent),
+			currentRetries:    make(map[string]map[int32]error),
+		}
+
+		sent := newProduceSet(parent)
+		safeAddMessage(t, sent, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")})
+		retryPartitionSet := sent.msgs["topic"][0]
+		require.True(t, parent.muter.tryMute(sent), "sent batch should mute its partition")
+
+		bp.handleError(sent, ErrOutOfBrokers)
+
+		retrySet := assertDoneWithin(t, output, 2*time.Second)
+		defer parent.muter.unmute(retrySet)
+		require.Equal(t, retryPartitionSet, retrySet.msgs["topic"][0])
+		require.Equal(t, 1, retryPartitionSet.msgs[0].retries)
+
+		contender := newProduceSet(parent)
+		safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+		require.False(t, parent.muter.tryMute(contender), "partition should stay muted by the retrying batch")
+	})
+}
+
+type stubLeaderClient struct {
+	cfg    *Config
+	leader *Broker
+}
+
+func (c *stubLeaderClient) Config() *Config                            { return c.cfg }
+func (c *stubLeaderClient) Controller() (*Broker, error)               { return nil, nil }
+func (c *stubLeaderClient) RefreshController() (*Broker, error)        { return nil, nil }
+func (c *stubLeaderClient) Brokers() []*Broker                         { return nil }
+func (c *stubLeaderClient) Broker(int32) (*Broker, error)              { return nil, nil }
+func (c *stubLeaderClient) Topics() ([]string, error)                  { return nil, nil }
+func (c *stubLeaderClient) Partitions(string) ([]int32, error)         { return nil, nil }
+func (c *stubLeaderClient) WritablePartitions(string) ([]int32, error) { return nil, nil }
+func (c *stubLeaderClient) Leader(topic string, partitionID int32) (*Broker, error) {
+	return c.leader, nil
+}
+func (c *stubLeaderClient) LeaderAndEpoch(string, int32) (*Broker, int32, error) {
+	return c.leader, 0, nil
+}
+func (c *stubLeaderClient) Replicas(string, int32) ([]int32, error)          { return nil, nil }
+func (c *stubLeaderClient) InSyncReplicas(string, int32) ([]int32, error)    { return nil, nil }
+func (c *stubLeaderClient) OfflineReplicas(string, int32) ([]int32, error)   { return nil, nil }
+func (c *stubLeaderClient) RefreshBrokers([]string) error                    { return nil }
+func (c *stubLeaderClient) RefreshMetadata(...string) error                  { return nil }
+func (c *stubLeaderClient) GetOffset(string, int32, int64) (int64, error)    { return 0, nil }
+func (c *stubLeaderClient) Coordinator(string) (*Broker, error)              { return nil, nil }
+func (c *stubLeaderClient) RefreshCoordinator(string) error                  { return nil }
+func (c *stubLeaderClient) TransactionCoordinator(string) (*Broker, error)   { return nil, nil }
+func (c *stubLeaderClient) RefreshTransactionCoordinator(string) error       { return nil }
+func (c *stubLeaderClient) InitProducerID() (*InitProducerIDResponse, error) { return nil, nil }
+func (c *stubLeaderClient) LeastLoadedBroker() *Broker                       { return c.leader }
+func (c *stubLeaderClient) PartitionNotReadable(string, int32) bool          { return false }
+func (c *stubLeaderClient) Close() error                                     { return nil }
+func (c *stubLeaderClient) Closed() bool                                     { return false }
+
 func testProducerInterceptor(
 	t *testing.T,
 	interceptors []ProducerInterceptor,
@@ -1650,7 +2294,7 @@ func testProducerInterceptor(
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
 
@@ -1658,7 +2302,7 @@ func testProducerInterceptor(
 	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
 	leader.Returns(prodSuccess)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		select {
 		case msg := <-producer.Errors():
 			t.Error(msg.Err)
@@ -1724,7 +2368,6 @@ func TestAsyncProducerInterceptors(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			testProducerInterceptor(t, tt.interceptors, tt.expectationFn)
 		})
@@ -1832,7 +2475,6 @@ func TestTxnProduceBumpEpoch(t *testing.T) {
 	broker.Returns(addPartitionsToTxnResponse)
 
 	produceResponse := new(ProduceResponse)
-	produceResponse.Version = 7
 	produceResponse.AddTopicPartition("test-topic", 0, ErrOutOfOrderSequenceNumber)
 	broker.Returns(produceResponse)
 
@@ -2001,7 +2643,7 @@ func TestTxnProduceBatchAddPartition(t *testing.T) {
 
 	go func() {
 		for err := range producer.Errors() {
-			require.NoError(t, err)
+			assert.NoError(t, err)
 		}
 	}()
 
@@ -2052,11 +2694,11 @@ func TestTxnProduceBatchAddPartition(t *testing.T) {
 
 	produceExchange := broker.History()[len(broker.History())-2]
 	produceRequest := produceExchange.Request.(*ProduceRequest)
-	require.Equal(t, 3, len(produceRequest.records["test-topic"]))
+	require.Len(t, produceRequest.records["test-topic"], 3)
 
 	addPartitionExchange := broker.History()[len(broker.History())-3]
 	addpartitionRequest := addPartitionExchange.Request.(*AddPartitionsToTxnRequest)
-	require.Equal(t, 3, len(addpartitionRequest.TopicPartitions["test-topic"]))
+	require.Len(t, addpartitionRequest.TopicPartitions["test-topic"], 3)
 	require.Contains(t, addpartitionRequest.TopicPartitions["test-topic"], int32(0))
 	require.Contains(t, addpartitionRequest.TopicPartitions["test-topic"], int32(1))
 	require.Contains(t, addpartitionRequest.TopicPartitions["test-topic"], int32(2))
@@ -2153,73 +2795,80 @@ func TestTxnCanAbort(t *testing.T) {
 	config.Producer.Retry.Max = 1
 	config.Net.MaxOpenRequests = 1
 
-	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 4
-	metadataLeader.ControllerID = broker.brokerID
-	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
-	metadataLeader.AddTopic("test-topic", ErrNoError)
-	metadataLeader.AddTopic("test-topic-2", ErrNoError)
-	metadataLeader.AddTopicPartition("test-topic", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
-	metadataLeader.AddTopicPartition("test-topic-2", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
-	broker.Returns(metadataLeader)
+	var (
+		mu                   sync.Mutex
+		addPartitionsCount   int
+		produceRequestsCount int
+	)
+
+	broker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": func(req *request) encoderWithHeader {
+			resp := new(MetadataResponse)
+			resp.Version = 4
+			resp.ControllerID = broker.BrokerID()
+			resp.AddBroker(broker.Addr(), broker.BrokerID())
+			resp.AddTopic("test-topic", ErrNoError)
+			resp.AddTopic("test-topic-2", ErrNoError)
+			resp.AddTopicPartition("test-topic", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+			resp.AddTopicPartition("test-topic-2", 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+			return resp
+		},
+		"FindCoordinatorRequest": func(req *request) encoderWithHeader {
+			resp := new(FindCoordinatorResponse)
+			resp.Version = 1
+			resp.Coordinator = &Broker{id: broker.BrokerID(), addr: broker.Addr()}
+			resp.Err = ErrNoError
+			return resp
+		},
+		"InitProducerIDRequest": func(req *request) encoderWithHeader {
+			return &InitProducerIDResponse{
+				Err:           ErrNoError,
+				ProducerID:    1,
+				ProducerEpoch: 0,
+			}
+		},
+		"AddPartitionsToTxnRequest": func(req *request) encoderWithHeader {
+			mu.Lock()
+			addPartitionsCount++
+			count := addPartitionsCount
+			mu.Unlock()
+
+			if count == 1 {
+				return &AddPartitionsToTxnResponse{
+					Errors: map[string][]*PartitionError{
+						"test-topic-2": {{Partition: 0, Err: ErrNoError}},
+					},
+				}
+			}
+			return &AddPartitionsToTxnResponse{
+				Errors: map[string][]*PartitionError{
+					"test-topic": {{Partition: 0, Err: ErrTopicAuthorizationFailed}},
+				},
+			}
+		},
+		"ProduceRequest": func(req *request) encoderWithHeader {
+			mu.Lock()
+			produceRequestsCount++
+			mu.Unlock()
+
+			resp := new(ProduceResponse)
+			resp.Version = 3
+			resp.AddTopicPartition("test-topic-2", 0, ErrNoError)
+			return resp
+		},
+		"EndTxnRequest": func(req *request) encoderWithHeader {
+			return &EndTxnResponse{Err: ErrNoError}
+		},
+	})
 
 	client, err := NewClient([]string{broker.Addr()}, config)
 	require.NoError(t, err)
 	defer client.Close()
 
-	findCoordinatorResponse := FindCoordinatorResponse{
-		Coordinator: client.Brokers()[0],
-		Err:         ErrNoError,
-		Version:     1,
-	}
-	broker.Returns(&findCoordinatorResponse)
-
-	producerIdResponse := &InitProducerIDResponse{
-		Err:           ErrNoError,
-		ProducerID:    1,
-		ProducerEpoch: 0,
-	}
-	broker.Returns(producerIdResponse)
-
 	ap, err := NewAsyncProducerFromClient(client)
 	producer := ap.(*asyncProducer)
 	require.NoError(t, err)
 	defer ap.Close()
-
-	broker.Returns(&AddPartitionsToTxnResponse{
-		Errors: map[string][]*PartitionError{
-			"test-topic-2": {
-				{
-					Partition: 0,
-					Err:       ErrNoError,
-				},
-			},
-		},
-	})
-
-	produceResponse := new(ProduceResponse)
-	produceResponse.Version = 3
-	produceResponse.AddTopicPartition("test-topic-2", 0, ErrNoError)
-	broker.Returns(produceResponse)
-
-	broker.Returns(&AddPartitionsToTxnResponse{
-		Errors: map[string][]*PartitionError{
-			"test-topic": {
-				{
-					Partition: 0,
-					Err:       ErrTopicAuthorizationFailed,
-				},
-			},
-		},
-	})
-
-	// now broker is closed due to error. will now reopen it
-	broker.Returns(metadataLeader)
-
-	endTxnResponse := &EndTxnResponse{
-		Err: ErrNoError,
-	}
-	broker.Returns(endTxnResponse)
 
 	require.Equal(t, ProducerTxnFlagReady, producer.txnmgr.status)
 
@@ -2234,7 +2883,7 @@ func TestTxnCanAbort(t *testing.T) {
 
 	err = producer.CommitTxn()
 	require.Error(t, err)
-	require.NotEqual(t, producer.txnmgr.status&ProducerTxnFlagAbortableError, 0)
+	require.NotEqual(t, 0, producer.txnmgr.status&ProducerTxnFlagAbortableError)
 
 	err = producer.AbortTxn()
 	require.NoError(t, err)
@@ -2306,24 +2955,20 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 				errorFound                bool
 			)
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for range producer.Successes() {
 					successes++
 				}
-			}()
+			})
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for errMsg := range producer.Errors() {
 					if errors.Is(errMsg.Err, ErrProducerRetryBufferOverflow) {
 						errorFound = true
 					}
 					producerErrors++
 				}
-			}()
+			})
 
 			longString := strings.Repeat("a", tt.messageSize)
 			val := StringEncoder(longString)
@@ -2401,22 +3046,18 @@ func ExampleAsyncProducer_goroutines() {
 		enqueued, successes, producerErrors int
 	)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for range producer.Successes() {
 			successes++
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for err := range producer.Errors() {
 			log.Println(err)
 			producerErrors++
 		}
-	}()
+	})
 
 ProducerLoop:
 	for {
@@ -2434,4 +3075,275 @@ ProducerLoop:
 	wg.Wait()
 
 	log.Printf("Successfully produced: %d; errors: %d\n", successes, producerErrors)
+}
+
+// TestAsyncProducerRetryOrdering verifies that message ordering is preserved during retries,
+// both with and without request pipelining (MaxOpenRequests=1 vs >1).
+func TestAsyncProducerRetryOrdering(t *testing.T) {
+	const topic = "my_topic"
+
+	extractValue := func(pr *ProduceRequest) string {
+		recordsByPartition := pr.records[topic]
+		if recordsByPartition == nil {
+			return ""
+		}
+		records := recordsByPartition[0]
+		if rb := records.RecordBatch; rb != nil && len(rb.Records) > 0 {
+			return string(rb.Records[0].Value)
+		}
+		if ms := records.MsgSet; ms != nil && len(ms.Messages) > 0 {
+			return string(ms.Messages[0].Msg.Value)
+		}
+		return ""
+	}
+
+	tests := []struct {
+		name            string
+		maxOpenRequests int
+		retryBackoff    time.Duration
+	}{
+		{
+			name:            "no pipelining (MaxOpenRequests=1)",
+			maxOpenRequests: 1,
+			retryBackoff:    0,
+		},
+		{
+			name:            "with pipelining (MaxOpenRequests=5)",
+			maxOpenRequests: 5,
+			retryBackoff:    50 * time.Millisecond,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seedBroker := NewMockBroker(t, 1)
+			leader := NewMockBroker(t, 2)
+
+			metadataResponse := new(MetadataResponse)
+			metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
+			metadataResponse.AddTopicPartition(topic, 0, leader.BrokerID(), nil, nil, nil, ErrNoError)
+			seedBroker.Returns(metadataResponse)
+
+			var (
+				mu              sync.Mutex
+				produceAttempts int
+				valuesSeen      []string
+			)
+
+			leader.setHandler(func(req *request) (res encoderWithHeader) {
+				switch typed := req.body.(type) {
+				case *MetadataRequest:
+					return metadataResponse
+				case *ProduceRequest:
+					mu.Lock()
+					defer mu.Unlock()
+
+					produceAttempts++
+					value := extractValue(typed)
+					valuesSeen = append(valuesSeen, value)
+
+					resp := new(ProduceResponse)
+					resp.Version = typed.Version
+					switch produceAttempts {
+					case 1:
+						resp.AddTopicPartition(topic, 0, ErrNotLeaderForPartition)
+					case 2, 3:
+						resp.AddTopicPartition(topic, 0, ErrNoError)
+					default:
+						t.Errorf("unexpected attempt %d", produceAttempts)
+						resp.AddTopicPartition(topic, 0, ErrNoError)
+					}
+					return resp
+				default:
+					return nil
+				}
+			})
+
+			config := NewTestConfig()
+			config.Producer.Return.Successes = true
+			config.Producer.Retry.Max = 3
+			config.Producer.Retry.Backoff = tt.retryBackoff
+			config.Producer.Flush.Messages = 1
+			config.Producer.Flush.MaxMessages = 1
+			config.Producer.Partitioner = NewManualPartitioner
+			config.Net.MaxOpenRequests = tt.maxOpenRequests
+
+			producer, err := NewAsyncProducer([]string{seedBroker.Addr()}, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			msgValues := []string{"msg-0", "msg-1"}
+			for _, val := range msgValues {
+				producer.Input() <- &ProducerMessage{Topic: topic, Partition: 0, Value: StringEncoder(val)}
+			}
+
+			expectResultsWithTimeout(t, producer, len(msgValues), 0, 10*time.Second)
+
+			mu.Lock()
+			attempts := produceAttempts
+			seen := make([]string, len(valuesSeen))
+			copy(seen, valuesSeen)
+			mu.Unlock()
+
+			closeProducer(t, producer)
+			seedBroker.Close()
+			leader.Close()
+
+			if attempts != 3 {
+				t.Errorf("expected 3 produce attempts, got %d", attempts)
+			}
+
+			// Both configurations should maintain ordering: msg-0 (fail), msg-0 (retry), msg-1
+			expectedOrder := []string{"msg-0", "msg-0", "msg-1"}
+			if !assert.Equal(t, expectedOrder, seen) {
+				t.Errorf("messages out of order: got %v, want %v", seen, expectedOrder)
+			}
+		})
+	}
+}
+
+// TestAsyncProducerPartitionUnmuting verifies that partitions are properly unmuted
+// in all error paths: send errors, NoResponse acks, etc. Without proper unmuting,
+// partitions remain muted and subsequent messages would block indefinitely.
+func TestAsyncProducerPartitionUnmuting(t *testing.T) {
+	const topic = "test_topic"
+
+	t.Run("NoResponse acks unmute partitions", func(t *testing.T) {
+		broker := NewMockBroker(t, 1)
+		defer broker.Close()
+
+		metadataResponse := NewMockMetadataResponse(t).
+			SetBroker(broker.Addr(), broker.BrokerID()).
+			SetLeader(topic, 0, broker.BrokerID())
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"MetadataRequest": metadataResponse,
+		})
+
+		config := NewTestConfig()
+		config.Producer.RequiredAcks = NoResponse
+		config.Producer.Return.Successes = true
+		config.Producer.Flush.Messages = 1
+		config.Net.MaxOpenRequests = 5
+
+		producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for range 3 {
+			producer.Input() <- &ProducerMessage{
+				Topic:     topic,
+				Partition: 0,
+				Value:     StringEncoder("msg"),
+			}
+		}
+
+		successCount := 0
+		for i := range 3 {
+			select {
+			case <-producer.Successes():
+				successCount++
+			case err := <-producer.Errors():
+				t.Fatalf("unexpected error: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timeout waiting for success %d (got %d) - partitions may not be unmuted", i+1, successCount)
+			}
+		}
+
+		if successCount != 3 {
+			t.Errorf("expected 3 successes, got %d", successCount)
+		}
+
+		closeProducer(t, producer)
+	})
+
+	t.Run("retry keeps partition muted until queued", func(t *testing.T) {
+		broker := NewMockBroker(t, 1)
+		defer broker.Close()
+
+		metadataResponse := new(MetadataResponse)
+		metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
+		metadataResponse.AddTopicPartition(topic, 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+
+		var attemptCount int
+		var mu sync.Mutex
+		firstRequestReceived := make(chan struct{})
+
+		broker.setHandler(func(req *request) (res encoderWithHeader) {
+			switch req.body.(type) {
+			case *MetadataRequest:
+				return metadataResponse
+			case *ProduceRequest:
+				mu.Lock()
+				attemptCount++
+				attempt := attemptCount
+				mu.Unlock()
+
+				if attempt == 1 {
+					close(firstRequestReceived)
+				}
+
+				resp := new(ProduceResponse)
+				if attempt == 1 {
+					resp.AddTopicPartition(topic, 0, ErrNotLeaderForPartition)
+				} else {
+					resp.AddTopicPartition(topic, 0, ErrNoError)
+				}
+				return resp
+			}
+			return nil
+		})
+
+		config := NewTestConfig()
+		config.Producer.Return.Successes = true
+		config.Producer.Retry.Max = 1
+		config.Producer.Retry.Backoff = 10 * time.Millisecond
+		config.Producer.Flush.Messages = 1
+		config.Net.MaxOpenRequests = 5
+
+		producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		producer.Input() <- &ProducerMessage{
+			Topic:     topic,
+			Partition: 0,
+			Value:     StringEncoder("msg-0"),
+		}
+
+		<-firstRequestReceived
+
+		producer.Input() <- &ProducerMessage{
+			Topic:     topic,
+			Partition: 0,
+			Value:     StringEncoder("msg-1"),
+		}
+
+		var successCount int
+		for range 2 {
+			select {
+			case <-producer.Successes():
+				successCount++
+			case err := <-producer.Errors():
+				t.Fatalf("unexpected error: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timeout waiting for success %d/%d - partition may be deadlocked", successCount, 2)
+			}
+		}
+
+		if successCount != 2 {
+			t.Errorf("expected 2 successes, got %d", successCount)
+		}
+
+		mu.Lock()
+		attempts := attemptCount
+		mu.Unlock()
+		if attempts != 3 {
+			t.Errorf("expected 3 produce attempts, got %d", attempts)
+		}
+
+		closeProducer(t, producer)
+	})
 }

@@ -107,16 +107,17 @@ func (sp *SyncProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
 		expectations := sp.expectations[0:len(msgs)]
 		sp.expectations = sp.expectations[len(msgs):]
 
-		for i, expectation := range expectations {
-			topic := msgs[i].Topic
-			partition, err := sp.partitioner(topic).Partition(msgs[i], sp.partitions(topic))
+		for i, msg := range msgs {
+			expectation := expectations[i]
+			topic := msg.Topic
+			partition, err := sp.partitioner(topic).Partition(msg, sp.partitions(topic))
 			if err != nil {
 				sp.t.Errorf("Partitioner returned an error: %s", err.Error())
 				return err
 			}
-			msgs[i].Partition = partition
+			msg.Partition = partition
 			if expectation.CheckFunction != nil {
-				errCheck := expectation.CheckFunction(msgs[i])
+				errCheck := expectation.CheckFunction(msg)
 				if errCheck != nil {
 					sp.t.Errorf("Check function returned an error: %s", errCheck.Error())
 					return errCheck
@@ -126,7 +127,7 @@ func (sp *SyncProducer) SendMessages(msgs []*sarama.ProducerMessage) error {
 				return expectation.Result
 			}
 			sp.lastOffset++
-			msgs[i].Offset = sp.lastOffset
+			msg.Offset = sp.lastOffset
 		}
 		return nil
 	}
@@ -259,6 +260,14 @@ func (sp *SyncProducer) AddOffsetsToTxn(offsets map[string][]*sarama.PartitionOf
 	return nil
 }
 
+func (sp *SyncProducer) AddOffsetsToTxnWithGroupMetadata(offsets map[string][]*sarama.PartitionOffsetMetadata, groupMetadata *sarama.ConsumerGroupMetadata) error {
+	return nil
+}
+
 func (sp *SyncProducer) AddMessageToTxn(msg *sarama.ConsumerMessage, groupId string, metadata *string) error {
+	return nil
+}
+
+func (sp *SyncProducer) AddMessageToTxnWithGroupMetadata(msg *sarama.ConsumerMessage, groupMetadata *sarama.ConsumerGroupMetadata, metadata *string) error {
 	return nil
 }

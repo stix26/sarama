@@ -18,6 +18,7 @@ import (
 // and the response versions our mocks use, we default to the minimum Kafka version in most tests
 func NewTestConfig() *Config {
 	config := NewConfig()
+	config.ApiVersionsRequest = false
 	config.Consumer.Retry.Backoff = 0
 	config.Producer.Retry.Backoff = 0
 	config.Version = MinVersion
@@ -574,11 +575,39 @@ func TestGroupInstanceIdAndVersionValidation(t *testing.T) {
 }
 
 func TestConsumerGroupStrategyCompatibility(t *testing.T) {
-	config := NewTestConfig()
-	config.Consumer.Group.Rebalance.Strategy = NewBalanceStrategySticky()
-	if err := config.Validate(); err != nil {
-		t.Error("Expected passing config validation, got ", err)
-	}
+	t.Run("deprecated singular strategy is accepted", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Group.Rebalance.Strategy = NewBalanceStrategySticky()
+		assert.NoError(t, config.Validate())
+	})
+
+	t.Run("strategies with no common rebalance protocol are rejected", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Group.Rebalance.GroupStrategies = []BalanceStrategy{
+			&stubProtocolStrategy{
+				BalanceStrategy: NewBalanceStrategyRange(),
+				protocols:       []RebalanceProtocol{RebalanceProtocolCooperative},
+			},
+			NewBalanceStrategyRange(), // eager-only
+		}
+		assert.Error(t, config.Validate())
+	})
+
+	t.Run("cooperative strategies require Version >= 2.4", func(t *testing.T) {
+		config := NewTestConfig()
+		config.Consumer.Group.Rebalance.GroupStrategies = []BalanceStrategy{
+			&stubProtocolStrategy{
+				BalanceStrategy: NewBalanceStrategyRange(),
+				protocols:       []RebalanceProtocol{RebalanceProtocolCooperative},
+			},
+		}
+
+		config.Version = V2_3_0_0
+		assert.Error(t, config.Validate())
+
+		config.Version = V2_4_0_0
+		assert.NoError(t, config.Validate())
+	})
 }
 
 // This example shows how to integrate with an existing registry as well as publishing metrics

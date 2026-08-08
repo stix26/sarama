@@ -79,6 +79,57 @@ func TestConsumerHighWaterMarkOffset(t *testing.T) {
 	safeClose(t, pc)
 }
 
+// TestConsumerPartialBatchRecovery exercises the partial-batch recovery path
+// (#1657): the consumer's initial Fetch.Default is smaller than the produced
+// record batch, so the broker returns a partial batch and reports its true
+// size. The follow-up fetch must use that reported size to deliver the
+// message in a single retry instead of doubling its way up.
+func TestConsumerPartialBatchRecovery(t *testing.T) {
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	const payloadSize = 256 * 1024
+
+	producerConfig := NewFunctionalTestConfig()
+	producerConfig.Producer.Return.Successes = true
+	producerConfig.Producer.MaxMessageBytes = 2 * payloadSize
+
+	p, err := NewSyncProducer(FunctionalTestEnv.KafkaBrokerAddrs, producerConfig)
+	assert.NoError(t, err)
+	defer safeClose(t, p)
+
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	_, offset, err := p.SendMessage(&ProducerMessage{Topic: "test.1", Value: ByteEncoder(payload)})
+	assert.NoError(t, err)
+
+	consumerConfig := NewFunctionalTestConfig()
+	// 12 bytes is the minimum that lets the broker include the per-batch length
+	// field in the partial response, so the consumer can size its retry exactly
+	consumerConfig.Consumer.Fetch.Default = 12
+	consumerConfig.Consumer.Fetch.Max = 2 * payloadSize
+
+	c, err := NewConsumer(FunctionalTestEnv.KafkaBrokerAddrs, consumerConfig)
+	assert.NoError(t, err)
+	defer safeClose(t, c)
+
+	pc, err := c.ConsumePartition("test.1", 0, offset)
+	assert.NoError(t, err)
+	defer safeClose(t, pc)
+
+	select {
+	case msg := <-pc.Messages():
+		assert.Equal(t, offset, msg.Offset)
+		assert.Equal(t, payload, msg.Value)
+	case err := <-pc.Errors():
+		t.Fatalf("consumer error: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the large message")
+	}
+}
+
 // Makes sure that messages produced by all supported client versions/
 // compression codecs (except LZ4) combinations can be consumed by all
 // supported consumer versions. It relies on the KAFKA_VERSION environment
@@ -365,6 +416,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 	assert.NoError(t, err)
 
 	ch := make(chan string, msgQty)
+	consumeErrCh := make(chan error, partitionsQty)
 	for i := 0; i < partitionsQty; i++ {
 		time.Sleep(250 * time.Millisecond) // ensure delays between the "claims"
 		wg.Add(1)
@@ -372,7 +424,10 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 			defer wg.Done()
 
 			pConsumer, err := consumer.ConsumePartition(topic, int32(i), OffsetOldest)
-			assert.NoError(t, err)
+			if err != nil {
+				consumeErrCh <- err
+				return
+			}
 			defer pConsumer.Close()
 
 			for {
@@ -417,7 +472,7 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 
 	cancel()
 
-	assert.Equal(t, msgQty, len(received))
+	assert.Len(t, received, msgQty)
 
 	err = producer.Close()
 	assert.NoError(t, err)
@@ -429,6 +484,10 @@ func TestConsumerGroupDeadlock(t *testing.T) {
 	assert.NoError(t, err)
 
 	wg.Wait()
+	close(consumeErrCh)
+	for err := range consumeErrCh {
+		assert.NoError(t, err)
+	}
 }
 
 func prodMsg2Str(prodMsg *ProducerMessage) string {
@@ -502,8 +561,6 @@ func produceMsgs(t *testing.T, clientVersions []KafkaVersion, codecs []Compressi
 			}
 			producers = append(producers, p)
 
-			prodVer := prodVer
-			codec := codec
 			g.Go(func() error {
 				t.Logf("*** Producing with client version %s codec %s\n", prodVer, codec)
 				var wg sync.WaitGroup
@@ -572,7 +629,6 @@ func consumeMsgs(t *testing.T, clientVersions []KafkaVersion, producedMessages [
 
 		var wg sync.WaitGroup
 		wg.Add(1)
-		consVer := consVer
 		g.Go(func() error {
 			// Consume as many messages as there have been produced and make sure that
 			// order is preserved.

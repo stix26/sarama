@@ -3,29 +3,43 @@
 package sarama
 
 import (
-	"runtime"
 	"testing"
 )
 
 func BenchmarkZstdMemoryConsumption(b *testing.B) {
 	params := ZstdEncoderParams{Level: 9}
 	buf := make([]byte, 1024*1024)
-	for i := 0; i < len(buf); i++ {
+	for i := range buf {
 		buf[i] = byte((i / 256) + (i * 257))
 	}
 
-	cpus := 96
-
-	gomaxprocsBackup := runtime.GOMAXPROCS(cpus)
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		for j := 0; j < 2*cpus; j++ {
+	b.Run("no_drain", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
 			_, _ = zstdCompress(params, nil, buf)
 		}
-		// drain the buffered encoder
-		getZstdEncoder(params)
-		// previously this would be achieved with
-		// zstdEncMap.Delete(params)
-	}
-	runtime.GOMAXPROCS(gomaxprocsBackup)
+	})
+
+	// Drops the buffered encoder so we can measure cold-start allocation.
+	b.Run("with_drain", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = zstdCompress(params, nil, buf)
+			_, _ = getZstdEncoder(params)
+		}
+	})
+
+	// Concurrent encodes, which historically allocated a fresh encoder per
+	// batch for every concurrent caller beyond the first. RunParallel uses
+	// GOMAXPROCS goroutines by default; SetParallelism scales that ratio for
+	// hosts where exercising more concurrency than CPUs is interesting.
+	b.Run("concurrent", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetParallelism(2)
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = zstdCompress(params, nil, buf)
+			}
+		})
+	})
 }

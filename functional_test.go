@@ -98,13 +98,13 @@ func NewFunctionalTestConfig() *Config {
 	config := NewConfig()
 	// config.Consumer.Retry.Backoff = 0
 	// config.Producer.Retry.Backoff = 0
-	config.Version = MinVersion
-	version, err := ParseKafkaVersion(os.Getenv("KAFKA_VERSION"))
-	if err != nil {
-		config.Version = DefaultVersion
-	} else {
-		config.Version = version
-	}
+
+	// Always use the maximum Sarama-supported API versions.
+	config.Version = MaxVersion
+	// Enable API versions negotiation with brokers. This will reduce the maximum
+	// API versions Sarama uses to never exceed the broker's supported versions.
+	config.ApiVersionsRequest = true
+
 	return config
 }
 
@@ -155,11 +155,14 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 	} else {
 		env.KafkaVersion = "3.5.1"
 	}
-
 	// docker compose v2.17.0 or newer required for `--wait-timeout` support
-	c := exec.Command(
-		"docker", "compose", "up", "-d", "--quiet-pull", "--timestamps", "--wait", "--wait-timeout", "600",
-	)
+	args := []string{"compose", "up", "-d", "--quiet-pull", "--timestamps", "--wait", "--wait-timeout", "600"}
+	v, _ := ParseKafkaVersion(env.KafkaVersion)
+	// use zookeeper for kafka < 4
+	if !v.IsAtLeast(V4_0_0_0) {
+		args = append([]string{"compose", "--profile", "zookeeper"}, args[1:]...)
+	}
+	c := exec.Command("docker", args...)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Env = append(os.Environ(), fmt.Sprintf("KAFKA_VERSION=%s", env.KafkaVersion))
@@ -190,14 +193,13 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 	allBrokersUp := false
 
 	Logger.Printf("waiting for kafka %s brokers to come up...\n", env.KafkaVersion)
-	time.Sleep(10 * time.Second)
 
 mainLoop:
-	for i := 0; i < 30 && !allBrokersUp; i++ {
+	for i := 0; i < 90 && !allBrokersUp; i++ {
 		if i > 0 {
 			Logger.Printf("still waiting for kafka %s brokers to come up...\n", env.KafkaVersion)
+			time.Sleep(time.Second)
 		}
-		time.Sleep(3 * time.Second)
 		brokersOk := make([]bool, len(env.KafkaBrokerAddrs))
 
 		// first check that all bootstrap brokers are TCP accessible
@@ -280,12 +282,22 @@ func existingEnvironment(ctx context.Context, env *testEnvironment) (bool, error
 }
 
 func tearDownDockerTestEnvironment(ctx context.Context, env *testEnvironment) error {
-	c := exec.Command("docker", "compose", "down", "--volumes")
+	args := []string{"compose", "down", "--volumes"}
+	v, _ := ParseKafkaVersion(env.KafkaVersion)
+	// use zookeeper profile for kafka < 4 to ensure zookeeper containers are stopped
+	if !v.IsAtLeast(V4_0_0_0) {
+		args = append([]string{"compose", "--profile", "zookeeper"}, args[1:]...)
+	}
+	c := exec.Command("docker", args...)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	downErr := c.Run()
 
-	c = exec.Command("docker", "compose", "rm", "-v", "--force", "--stop")
+	args = []string{"compose", "rm", "-v", "--force", "--stop"}
+	if !v.IsAtLeast(V4_0_0_0) {
+		args = append([]string{"compose", "--profile", "zookeeper"}, args[1:]...)
+	}
+	c = exec.Command("docker", args...)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	rmErr := c.Run()
@@ -364,8 +376,8 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	{
 		var topicsOk bool
 		request := NewMetadataRequest(config.Version, testTopicNames)
-		for i := 0; i < 60 && !topicsOk; i++ {
-			time.Sleep(1 * time.Second)
+		for i := 0; i < 600 && !topicsOk; i++ {
+			time.Sleep(100 * time.Millisecond)
 			md, err := controller.GetMetadata(request)
 			if err != nil {
 				return fmt.Errorf("failed to get metadata for test topics: %w", err)
@@ -387,7 +399,7 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 
 	// now create the topics empty
 	{
-		request := NewCreateTopicsRequest(config.Version, testTopicDetails, time.Minute)
+		request := NewCreateTopicsRequest(config.Version, testTopicDetails, time.Minute, false)
 		createRes, err := controller.CreateTopics(request)
 		if err != nil {
 			return fmt.Errorf("failed to create test topics: %w", err)
@@ -404,8 +416,8 @@ func prepareTestTopics(ctx context.Context, env *testEnvironment) error {
 	{
 		var topicsOk bool
 		request := NewMetadataRequest(config.Version, testTopicNames)
-		for i := 0; i < 60 && !topicsOk; i++ {
-			time.Sleep(1 * time.Second)
+		for i := 0; i < 600 && !topicsOk; i++ {
+			time.Sleep(100 * time.Millisecond)
 			md, err := controller.GetMetadata(request)
 			if err != nil {
 				return fmt.Errorf("failed to get metadata for test topics: %w", err)
@@ -461,6 +473,21 @@ func SaveProxy(t *testing.T, px string) {
 	}
 }
 
+func proxyForBrokerID(t testing.TB, brokerID int32) *toxiproxy.Proxy {
+	proxyName := fmt.Sprintf("kafka%d", brokerID)
+	proxy := FunctionalTestEnv.Proxies[proxyName]
+	if proxy == nil {
+		t.Fatalf("toxiproxy %s not found", proxyName)
+	}
+	return proxy
+}
+
+func addResetPeerToxic(t testing.TB, proxy *toxiproxy.Proxy) {
+	if _, err := proxy.AddToxic("reset-peer", "reset_peer", "downstream", 1, toxiproxy.Attributes{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func setupFunctionalTest(t testing.TB) {
 	resetProxies(t)
 	ensureFullyReplicated(t, 60*time.Second, 5*time.Second)
@@ -477,7 +504,6 @@ func ensureFullyReplicated(t testing.TB, timeout time.Duration, retry time.Durat
 	config.Metadata.Retry.Max = 5
 	config.Metadata.Retry.Backoff = 10 * time.Second
 	config.ClientID = "sarama-ensureFullyReplicated"
-	config.ApiVersionsRequest = false
 
 	var testTopicNames []string
 	for topic := range testTopicDetails {

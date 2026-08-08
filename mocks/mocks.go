@@ -16,6 +16,7 @@ package mocks
 import (
 	"errors"
 	"fmt"
+	"maps"
 
 	"github.com/IBM/sarama"
 )
@@ -23,7 +24,7 @@ import (
 // ErrorReporter is a simple interface that includes the testing.T methods we use to report
 // expectation violations when using the mock objects.
 type ErrorReporter interface {
-	Errorf(string, ...interface{})
+	Errorf(string, ...any)
 }
 
 // ValueChecker is a function type to be set in each expectation of the producer mocks
@@ -86,9 +87,7 @@ func (pc *TopicConfig) SetDefaultPartitions(n int32) {
 // SetPartitions sets the number of partitions the partitioners will see for specific topics. This
 // only applies to messages produced after setting them.
 func (pc *TopicConfig) SetPartitions(partitions map[string]int32) {
-	for p, n := range partitions {
-		pc.overridePartitions[p] = n
-	}
+	maps.Copy(pc.overridePartitions, partitions)
 }
 
 func (pc *TopicConfig) partitions(topic string) int32 {

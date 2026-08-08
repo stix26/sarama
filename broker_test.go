@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jcmturner/gokrb5/v8/krberror"
 	"github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/require"
 )
 
 func ExampleBroker() {
@@ -114,7 +116,6 @@ func (p produceResponsePromise) Get() (*ProduceResponse, error) {
 
 func TestSimpleBrokerCommunication(t *testing.T) {
 	for _, tt := range brokerTestTable {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			Logger.Printf("Testing broker communication for %s", tt.name)
 			mb := NewMockBroker(t, 0)
@@ -158,7 +159,6 @@ func TestSimpleBrokerCommunication(t *testing.T) {
 
 func TestBrokerFailedRequest(t *testing.T) {
 	for _, tt := range brokerFailedReqTestTable {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Logf("Testing broker communication for %s", tt.name)
 			mb := NewMockBroker(t, 0)
@@ -198,7 +198,176 @@ func TestBrokerFailedRequest(t *testing.T) {
 	}
 }
 
-var ErrTokenFailure = errors.New("failure generating token")
+func TestBrokerClose(t *testing.T) {
+	t.Run("interrupts active async response reads", func(t *testing.T) {
+		mockBroker := NewMockBroker(t, 0)
+		defer mockBroker.Close()
+
+		broker := NewBroker(mockBroker.Addr())
+		conf := NewTestConfig()
+		conf.ApiVersionsRequest = false
+		conf.Net.ReadTimeout = 30 * time.Second
+
+		require.NoError(t, broker.Open(conf))
+
+		request := ProduceRequest{}
+		request.RequiredAcks = WaitForLocal
+
+		responseErrs := make(chan error, 1)
+		err := broker.AsyncProduce(&request, func(_ *ProduceResponse, err error) {
+			responseErrs <- err
+		})
+		require.NoError(t, err)
+
+		closeErrs := make(chan error, 1)
+		go func() {
+			closeErrs <- broker.Close()
+		}()
+
+		select {
+		case err := <-closeErrs:
+			require.NoError(t, err)
+		case <-time.After(250 * time.Millisecond):
+			require.FailNow(t, "Close blocked with an active async response read")
+		}
+
+		select {
+		case err := <-responseErrs:
+			require.Error(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for the async produce callback")
+		}
+
+		connected, err := broker.Connected()
+		require.NoError(t, err)
+		require.False(t, connected)
+	})
+}
+
+// closeImmediatelyDialer is a test dialer that returns a net.Conn whose peer is
+// already closed. This reliably triggers a transport-level failure (e.g. EOF)
+// during ApiVersions negotiation in Broker.Open.
+type closeImmediatelyDialer struct{}
+
+func (closeImmediatelyDialer) Dial(_, _ string) (net.Conn, error) {
+	client, server := net.Pipe()
+	_ = server.Close()
+	return client, nil
+}
+
+func TestBrokerOpenApiVersionsTransportError(t *testing.T) {
+	t.Parallel()
+
+	conf := NewConfig()
+	conf.ApiVersionsRequest = true
+	conf.Net.Proxy.Enable = true
+	conf.Net.Proxy.Dialer = closeImmediatelyDialer{}
+
+	broker := NewBroker("127.0.0.1:9092")
+
+	if err := broker.Open(conf); err != nil {
+		t.Fatalf("unexpected Open error: %v", err)
+	}
+
+	connected, connErr := broker.Connected()
+	if connected {
+		t.Fatalf("expected broker to be disconnected")
+	}
+	if connErr == nil {
+		t.Fatalf("expected connection error")
+	}
+	if !shouldCloseBrokerConn(connErr) {
+		t.Fatalf("expected transport-level error, got: %v", connErr)
+	}
+
+	// Subsequent operations should surface the original connection error.
+	_, err := broker.GetMetadata(&MetadataRequest{})
+	if err == nil {
+		t.Fatalf("expected metadata request to fail")
+	}
+	if !errors.Is(err, connErr) {
+		t.Fatalf("expected original connection error, got: %v want: %v", err, connErr)
+	}
+
+	// Open() should be retryable after a fatal ApiVersions transport error.
+	if err := broker.Open(conf); errors.Is(err, ErrAlreadyConnected) {
+		t.Fatalf("expected Open retry allowed, got: %v", err)
+	}
+	_, _ = broker.Connected()
+}
+
+func TestBrokerOpenSASLv1FailThenReopenTransportError(t *testing.T) {
+	t.Parallel()
+
+	mockBroker := NewMockBroker(t, 0)
+	defer mockBroker.Close()
+
+	mockBroker.SetHandlerByMap(map[string]MockResponse{
+		"ApiVersionsRequest":      NewMockApiVersionsResponse(t),
+		"SaslHandshakeRequest":    NewMockSaslHandshakeResponse(t).SetEnabledMechanisms([]string{SASLTypeOAuth}),
+		"SaslAuthenticateRequest": NewMockSaslAuthenticateResponse(t).SetError(ErrSASLAuthenticationFailed),
+	})
+
+	broker := NewBroker(mockBroker.Addr())
+
+	// first Open: SASL v1 auth fails after b.responses channel is created
+	conf := NewTestConfig()
+	conf.Net.SASL.Enable = true
+	conf.Net.SASL.Mechanism = SASLTypeOAuth
+	conf.Net.SASL.TokenProvider = newTokenProvider(&AccessToken{Token: "test"}, nil)
+	conf.Version = V1_0_0_0
+
+	err := broker.Open(conf)
+	require.NoError(t, err)
+
+	connected, connErr := broker.Connected()
+	require.False(t, connected)
+	require.Error(t, connErr)
+
+	// second Open with a transport error during ApiVersions must not panic
+	// with "close of closed channel"
+	conf2 := NewTestConfig()
+	conf2.ApiVersionsRequest = true
+	conf2.Net.Proxy.Enable = true
+	conf2.Net.Proxy.Dialer = closeImmediatelyDialer{}
+
+	require.NotErrorIs(t, broker.Open(conf2), ErrAlreadyConnected)
+	_, _ = broker.Connected()
+}
+
+func TestBrokerFetch(t *testing.T) {
+	t.Run("metric mark does not race with concurrent reopen", func(t *testing.T) {
+		mb := NewMockBroker(t, 1)
+		defer mb.Close()
+		mb.SetHandlerByMap(map[string]MockResponse{
+			"FetchRequest": NewMockFetchResponse(t, 1),
+		})
+
+		broker := NewBroker(mb.Addr())
+		conf := NewTestConfig()
+		conf.Version = V0_11_0_0
+		require.NoError(t, broker.Open(conf))
+		t.Cleanup(func() { _ = broker.Close() })
+
+		req := &FetchRequest{MaxWaitTime: 100, MinBytes: 1, Version: 4}
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for range 500 {
+				_, _ = broker.Fetch(req)
+			}
+		})
+		wg.Go(func() {
+			for range 50 {
+				_ = broker.Close()
+				_ = broker.Open(conf)
+			}
+		})
+		wg.Wait()
+	})
+}
+
+var ErrTokenFailure = errors.New("Failure generating token")
 
 type TokenProvider struct {
 	accessToken *AccessToken
@@ -287,7 +456,6 @@ func TestSASLOAuthBearer(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			// mockBroker mocks underlying network logic and broker responses
 			mockBroker := NewMockBroker(t, 0)
@@ -402,7 +570,6 @@ func TestSASLSCRAMSHAXXX(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			// mockBroker mocks underlying network logic and broker responses
 			mockBroker := NewMockBroker(t, 0)
@@ -500,7 +667,6 @@ func TestSASLPlainAuth(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			// mockBroker mocks underlying network logic and broker responses
 			mockBroker := NewMockBroker(t, 0)
@@ -671,7 +837,7 @@ func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
 		},
 		{
 			name:  "Kerberos client creation fails",
-			error: errors.New("configuration file could not be opened: krb5.conf open krb5.conf: no such file or directory"),
+			error: errors.New("configuration file could not be opened: testdata/krb5.conf open testdata/krb5.conf: no such file or directory"),
 		},
 		{
 			name:               "Bad server response, unmarshall key error",
@@ -688,7 +854,6 @@ func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
 		},
 	}
 	for i, test := range testTable {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			mockBroker := NewMockBroker(t, 0)
 			// broker executes SASL requests against mockBroker
@@ -707,10 +872,11 @@ func TestGSSAPIKerberosAuth_Authorize(t *testing.T) {
 			broker.requestsInFlight = metrics.NilCounter{}
 
 			conf := NewTestConfig()
+			conf.Net.SASL.Version = SASLHandshakeV0
 			conf.Net.SASL.Mechanism = SASLTypeGSSAPI
 			conf.Net.SASL.Enable = true
 			conf.Net.SASL.GSSAPI.ServiceName = "kafka"
-			conf.Net.SASL.GSSAPI.KerberosConfigPath = "krb5.conf"
+			conf.Net.SASL.GSSAPI.KerberosConfigPath = "testdata/krb5.conf"
 			conf.Net.SASL.GSSAPI.Realm = "EXAMPLE.COM"
 			conf.Net.SASL.GSSAPI.Username = "kafka"
 			conf.Net.SASL.GSSAPI.Password = "kafka"
@@ -793,7 +959,6 @@ func TestBuildClientFirstMessage(t *testing.T) {
 	}
 
 	for i, test := range testTable {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			actual, err := buildClientFirstMessage(test.token)
 
@@ -1414,7 +1579,7 @@ func BenchmarkBroker_Open(b *testing.B) {
 	metrics.UseNilMetrics = false
 	conf := NewTestConfig()
 	conf.Version = V1_0_0_0
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := broker.Open(conf)
 		if err != nil {
 			b.Fatal(err)
@@ -1431,7 +1596,7 @@ func BenchmarkBroker_No_Metrics_Open(b *testing.B) {
 	metrics.UseNilMetrics = true
 	conf := NewTestConfig()
 	conf.Version = V1_0_0_0
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := broker.Open(conf)
 		if err != nil {
 			b.Fatal(err)

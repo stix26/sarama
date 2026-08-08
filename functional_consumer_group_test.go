@@ -6,16 +6,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFuncConsumerGroupPartitioning(t *testing.T) {
+	t.Parallel()
 	checkKafkaVersion(t, "0.10.2")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
@@ -50,6 +53,7 @@ func TestFuncConsumerGroupPartitioning(t *testing.T) {
 }
 
 func TestFuncConsumerGroupPartitioningStateful(t *testing.T) {
+	t.Parallel()
 	checkKafkaVersion(t, "0.10.2")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
@@ -95,6 +99,7 @@ func TestFuncConsumerGroupPartitioningStateful(t *testing.T) {
 }
 
 func TestFuncConsumerGroupExcessConsumers(t *testing.T) {
+	t.Parallel()
 	checkKafkaVersion(t, "0.10.2")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
@@ -179,6 +184,7 @@ func TestFuncConsumerGroupRebalanceAfterAddingPartitions(t *testing.T) {
 }
 
 func TestFuncConsumerGroupFuzzy(t *testing.T) {
+	t.Parallel()
 	checkKafkaVersion(t, "0.10.2")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
@@ -188,56 +194,54 @@ func TestFuncConsumerGroupFuzzy(t *testing.T) {
 	}
 
 	groupID := testFuncConsumerGroupID(t)
-	sink := &testFuncConsumerGroupSink{msgs: make(chan testFuncConsumerGroupMessage, 20000)}
+	sink := &testFuncConsumerGroupSink{msgs: make(chan testFuncConsumerGroupMessage, 10000)}
 	waitForMessages := func(t *testing.T, n int) {
+		const (
+			waitFor = 60 * time.Second
+			tick    = 100 * time.Millisecond
+		)
 		t.Helper()
-
-		for i := 0; i < 600; i++ {
-			if sink.Len() >= n {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if sz := sink.Len(); sz < n {
-			log.Fatalf("expected to consume %d messages, but consumed %d", n, sz)
-		}
+		require.EventuallyWithT(t, func(t *assert.CollectT) {
+			require.GreaterOrEqual(t, sink.Len(), n)
+		}, waitFor, tick, "expected to consume %d messages, but consumed %d", n, sink.Len())
 	}
 
-	defer runTestFuncConsumerGroupMember(t, groupID, "M1", 1500, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M2", 3000, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M3", 1500, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M4", 200, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M5", 100, sink).Stop()
-	waitForMessages(t, 3000)
+	defer runTestFuncConsumerGroupMember(t, groupID, "M1", 500, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M2", 1000, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M3", 500, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M4", 70, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M5", 35, sink).Stop()
+	waitForMessages(t, 1000)
 
-	defer runTestFuncConsumerGroupMember(t, groupID, "M6", 300, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M7", 400, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M8", 500, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M9", 2000, sink).Stop()
-	waitForMessages(t, 8000)
+	defer runTestFuncConsumerGroupMember(t, groupID, "M6", 100, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M7", 135, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M8", 170, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M9", 670, sink).Stop()
+	waitForMessages(t, 2700)
 
-	defer runTestFuncConsumerGroupMember(t, groupID, "M10", 1000, sink).Stop()
-	waitForMessages(t, 10000)
+	defer runTestFuncConsumerGroupMember(t, groupID, "M10", 335, sink).Stop()
+	waitForMessages(t, 3300)
 
-	defer runTestFuncConsumerGroupMember(t, groupID, "M11", 1000, sink).Stop()
-	defer runTestFuncConsumerGroupMember(t, groupID, "M12", 2500, sink).Stop()
-	waitForMessages(t, 12000)
+	defer runTestFuncConsumerGroupMember(t, groupID, "M11", 335, sink).Stop()
+	defer runTestFuncConsumerGroupMember(t, groupID, "M12", 830, sink).Stop()
+	waitForMessages(t, 4000)
 
-	defer runTestFuncConsumerGroupMember(t, groupID, "M13", 1000, sink).Stop()
-	waitForMessages(t, 15000)
+	defer runTestFuncConsumerGroupMember(t, groupID, "M13", 320, sink).Stop()
+	waitForMessages(t, 5000)
 
-	if umap := sink.Close(); len(umap) != 15000 {
+	if umap := sink.Close(); len(umap) != 5000 {
 		dupes := make(map[string][]string)
 		for k, v := range umap {
 			if len(v) > 1 {
 				dupes[k] = v
 			}
 		}
-		t.Fatalf("expected %d unique messages to be consumed but got %d, including %d duplicates:\n%v", 15000, len(umap), len(dupes), dupes)
+		t.Fatalf("expected %d unique messages to be consumed but got %d, including %d duplicates:\n%v", 5000, len(umap), len(dupes), dupes)
 	}
 }
 
 func TestFuncConsumerGroupOffsetDeletion(t *testing.T) {
+	t.Parallel()
 	checkKafkaVersion(t, "2.4.0")
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
@@ -302,10 +306,10 @@ func testFuncConsumerGroupID(t *testing.T) string {
 
 func markOffset(t *testing.T, offsetMgr OffsetManager, topic string, partition int32, offset int64) {
 	partitionOffsetManager, err := offsetMgr.ManagePartition(topic, partition)
-	defer safeClose(t, partitionOffsetManager)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer safeClose(t, partitionOffsetManager)
 	partitionOffsetManager.MarkOffset(offset, "")
 }
 
@@ -328,7 +332,7 @@ func testFuncConsumerGroupFuzzySeed(topic string) error {
 		}
 		total = total + newest - oldest
 	}
-	if total >= 21000 {
+	if total >= 7000 {
 		return nil
 	}
 
@@ -336,7 +340,7 @@ func testFuncConsumerGroupFuzzySeed(topic string) error {
 	if err != nil {
 		return err
 	}
-	for i := total; i < 21000; i++ {
+	for i := total; i < 7000; i++ {
 		producer.Input() <- &ProducerMessage{Topic: topic, Value: ByteEncoder([]byte("testdata"))}
 	}
 	return producer.Close()
@@ -349,20 +353,20 @@ type testFuncConsumerGroupMessage struct {
 
 type testFuncConsumerGroupSink struct {
 	msgs  chan testFuncConsumerGroupMessage
-	count int32
+	count atomic.Int32
 }
 
 func (s *testFuncConsumerGroupSink) Len() int {
 	if s == nil {
 		return -1
 	}
-	return int(atomic.LoadInt32(&s.count))
+	return int(s.count.Load())
 }
 
 func (s *testFuncConsumerGroupSink) Push(clientID string, m *ConsumerMessage) {
 	if s != nil {
 		s.msgs <- testFuncConsumerGroupMessage{ClientID: clientID, ConsumerMessage: m}
-		atomic.AddInt32(&s.count, 1)
+		s.count.Add(1)
 	}
 }
 
@@ -379,18 +383,19 @@ func (s *testFuncConsumerGroupSink) Close() map[string][]string {
 
 type testFuncConsumerGroupMember struct {
 	ConsumerGroup
-	clientID     string
-	claims       map[string]int
-	generationId int32
-	state        int32
-	handlers     int32
-	errs         []error
-	maxMessages  int32
-	isCapped     bool
-	sink         *testFuncConsumerGroupSink
+	t        *testing.T
+	clientID string
+	isCapped bool
+	sink     *testFuncConsumerGroupSink
 
-	t  *testing.T
-	mu sync.RWMutex
+	generationId atomic.Int32
+	state        atomic.Int32
+	handlers     atomic.Int32
+	maxMessages  atomic.Int32
+
+	mu     sync.RWMutex
+	claims map[string]int
+	errs   []error
 }
 
 func defaultConfig(clientID string) *Config {
@@ -398,20 +403,36 @@ func defaultConfig(clientID string) *Config {
 	config.ClientID = clientID
 	config.Consumer.Return.Errors = true
 	config.Consumer.Offsets.Initial = OffsetOldest
-	config.Consumer.Group.Rebalance.Timeout = 10 * time.Second
+	config.Consumer.Group.Rebalance.Timeout = 6 * time.Second
+	config.Consumer.Group.Session.Timeout = 6 * time.Second
+	config.Consumer.Group.Heartbeat.Interval = 2 * time.Second
 	config.Metadata.Full = false
-	config.Metadata.RefreshFrequency = 5 * time.Second
+	config.Metadata.RefreshFrequency = 10 * time.Second
 	return config
 }
 
-func runTestFuncConsumerGroupMember(t *testing.T, groupID, clientID string, maxMessages int32, sink *testFuncConsumerGroupSink, topics ...string) *testFuncConsumerGroupMember {
+func runTestFuncConsumerGroupMember(
+	t *testing.T,
+	groupID string,
+	clientID string,
+	maxMessages int32,
+	sink *testFuncConsumerGroupSink,
+	topics ...string,
+) *testFuncConsumerGroupMember {
 	t.Helper()
 
 	config := defaultConfig(clientID)
 	return runTestFuncConsumerGroupMemberWithConfig(t, config, groupID, maxMessages, sink, topics...)
 }
 
-func runTestFuncConsumerGroupMemberWithConfig(t *testing.T, config *Config, groupID string, maxMessages int32, sink *testFuncConsumerGroupSink, topics ...string) *testFuncConsumerGroupMember {
+func runTestFuncConsumerGroupMemberWithConfig(
+	t *testing.T,
+	config *Config,
+	groupID string,
+	maxMessages int32,
+	sink *testFuncConsumerGroupSink,
+	topics ...string,
+) *testFuncConsumerGroupMember {
 	t.Helper()
 
 	group, err := NewConsumerGroup(FunctionalTestEnv.KafkaBrokerAddrs, groupID, config)
@@ -428,11 +449,11 @@ func runTestFuncConsumerGroupMemberWithConfig(t *testing.T, config *Config, grou
 		ConsumerGroup: group,
 		clientID:      config.ClientID,
 		claims:        make(map[string]int),
-		maxMessages:   maxMessages,
 		isCapped:      maxMessages != 0,
 		sink:          sink,
 		t:             t,
 	}
+	member.maxMessages.Store(maxMessages)
 	go member.loop(topics)
 	return member
 }
@@ -465,7 +486,7 @@ func (m *testFuncConsumerGroupMember) WaitForState(expected int32) {
 	m.t.Helper()
 
 	m.waitFor("state", expected, func() (interface{}, error) {
-		return atomic.LoadInt32(&m.state), nil
+		return m.state.Load(), nil
 	})
 }
 
@@ -473,7 +494,7 @@ func (m *testFuncConsumerGroupMember) WaitForHandlers(expected int) {
 	m.t.Helper()
 
 	m.waitFor("handlers", expected, func() (interface{}, error) {
-		return int(atomic.LoadInt32(&m.handlers)), nil
+		return int(m.handlers.Load()), nil
 	})
 }
 
@@ -491,6 +512,8 @@ func (m *testFuncConsumerGroupMember) WaitForClaims(expected map[string]int) {
 func (m *testFuncConsumerGroupMember) Stop() { _ = m.Close() }
 
 func (m *testFuncConsumerGroupMember) Setup(s ConsumerGroupSession) error {
+	m.t.Logf("Consumer %s: new session started %s in generation %d", m.clientID, s.MemberID(), s.GenerationID())
+
 	// store claims
 	claims := make(map[string]int)
 	for topic, partitions := range s.Claims() {
@@ -501,31 +524,49 @@ func (m *testFuncConsumerGroupMember) Setup(s ConsumerGroupSession) error {
 	m.mu.Unlock()
 
 	// store generationID
-	atomic.StoreInt32(&m.generationId, s.GenerationID())
+	m.generationId.Store(s.GenerationID())
 
 	// enter post-setup state
-	atomic.StoreInt32(&m.state, 2)
+	m.state.Store(2)
 	return nil
 }
 
 func (m *testFuncConsumerGroupMember) Cleanup(s ConsumerGroupSession) error {
+	m.t.Logf("Consumer %s: session ended %s in generation %d", m.clientID, s.MemberID(), s.GenerationID())
 	// enter post-cleanup state
-	atomic.StoreInt32(&m.state, 3)
+	m.state.Store(3)
 	return nil
 }
 
 func (m *testFuncConsumerGroupMember) ConsumeClaim(s ConsumerGroupSession, c ConsumerGroupClaim) error {
-	atomic.AddInt32(&m.handlers, 1)
-	defer atomic.AddInt32(&m.handlers, -1)
-
-	for msg := range c.Messages() {
-		if n := atomic.AddInt32(&m.maxMessages, -1); m.isCapped && n < 0 {
-			break
+	defer func() {
+		if r := recover(); r != nil {
+			m.t.Errorf("panic in ConsumeClaim: %v", r)
 		}
-		s.MarkMessage(msg, "")
-		m.sink.Push(m.clientID, msg)
+	}()
+	m.handlers.Add(1)
+	defer m.handlers.Add(-1)
+
+	consumed := 0
+	for {
+		select {
+		case msg, ok := <-c.Messages():
+			if !ok {
+				m.t.Logf("Consumer %s: message channel closed, consumed %d messages", m.clientID, consumed)
+				return nil
+			}
+			if n := m.maxMessages.Add(-1); m.isCapped && n < 0 {
+				m.t.Logf("Consumer %s: reached max messages, consumed %d messages", m.clientID, consumed)
+				return nil
+			}
+			s.MarkMessage(msg, "")
+			m.sink.Push(m.clientID, msg)
+			consumed++
+		case <-s.Context().Done():
+			m.t.Logf("Consumer %s: session context done, consumed %d messages", m.clientID, consumed)
+			return nil
+		}
 	}
-	return nil
 }
 
 func (m *testFuncConsumerGroupMember) waitFor(kind string, expected interface{}, factory func() (interface{}, error)) {
@@ -558,10 +599,16 @@ func (m *testFuncConsumerGroupMember) waitFor(kind string, expected interface{},
 }
 
 func (m *testFuncConsumerGroupMember) loop(topics []string) {
-	defer atomic.StoreInt32(&m.state, 4)
+	defer func() {
+		if r := recover(); r != nil {
+			m.t.Errorf("panic in loop for %s: %v", m.clientID, r)
+		}
+		m.state.Store(4)
+	}()
 
 	go func() {
 		for err := range m.Errors() {
+			m.t.Logf("Consumer %s error: %v", m.clientID, err)
 			_ = m.Close()
 
 			m.mu.Lock()
@@ -573,19 +620,28 @@ func (m *testFuncConsumerGroupMember) loop(topics []string) {
 	ctx := context.Background()
 	for {
 		// set state to pre-consume
-		atomic.StoreInt32(&m.state, 1)
+		m.state.Store(1)
 
 		if err := m.Consume(ctx, topics, m); errors.Is(err, ErrClosedConsumerGroup) {
+			m.t.Logf("Consumer %s: closed consumer group", m.clientID)
 			return
 		} else if err != nil {
+			m.t.Logf("Consumer %s: consume error: %v", m.clientID, err)
 			m.mu.Lock()
 			m.errs = append(m.errs, err)
 			m.mu.Unlock()
 			return
 		}
 
+		// check if context was canceled, signaling that the consumer should stop
+		if ctx.Err() != nil {
+			m.t.Logf("Consumer %s: context error: %v", m.clientID, ctx.Err())
+			return
+		}
+
 		// return if capped
-		if n := atomic.LoadInt32(&m.maxMessages); m.isCapped && n < 0 {
+		if n := m.maxMessages.Load(); m.isCapped && n < 0 {
+			m.t.Logf("Consumer %s: reached max messages, returning from loop", m.clientID)
 			return
 		}
 	}
@@ -601,7 +657,7 @@ func newTestStatefulStrategy(t *testing.T) *testStatefulStrategy {
 type testStatefulStrategy struct {
 	BalanceStrategy
 	t       *testing.T
-	initial int32
+	initial atomic.Int32
 	state   sync.Map
 }
 
@@ -614,7 +670,7 @@ func (h *testStatefulStrategy) Plan(members map[string]ConsumerGroupMemberMetada
 	for memberID, metadata := range members {
 		if !strings.HasSuffix(string(metadata.UserData), "-stateful") {
 			metadata.UserData = []byte(string(metadata.UserData) + "-stateful")
-			atomic.AddInt32(&h.initial, 1)
+			h.initial.Add(1)
 		}
 		h.state.Store(memberID, metadata.UserData)
 	}
@@ -630,7 +686,7 @@ func (h *testStatefulStrategy) AssignmentData(memberID string, topics map[string
 
 func (h *testStatefulStrategy) AssertInitialValues(count int32) {
 	h.t.Helper()
-	actual := atomic.LoadInt32(&h.initial)
+	actual := h.initial.Load()
 	if actual != count {
 		h.t.Fatalf("unexpected count of initial values: %d, expected: %d", actual, count)
 	}

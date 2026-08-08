@@ -29,6 +29,86 @@ var (
 		0, 42,
 		0, 3, 'm', 's', 'g',
 	}
+
+	createTopicsResponseV5 = []byte{
+		0, 0, 0, 100,
+		2,
+		6, 't', 'o', 'p', 'i', 'c',
+		0, 42, // invalid request error
+		4, 'm', 's', 'g', // error message
+		0, 0, 0, 1, // num partitions
+		0, 2, // replication factor
+		2,                // 1 config
+		4, 'b', 'a', 'r', // name
+		4, 'b', 'a', 'z', // value
+		0, // read only
+		5, // source default
+		0, // is sensitive
+		0, // empty tagged fields
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
+
+	createTopicsResponseV6 = []byte{
+		0, 0, 0, 100,
+		2,
+		6, 't', 'o', 'p', 'i', 'c',
+		0, 89, // throttling quota exceeded error
+		4, 'm', 's', 'g', // error message
+		0, 0, 0, 1, // num partitions
+		0, 2, // replication factor
+		2,                // 1 config
+		4, 'b', 'a', 'r', // name
+		4, 'b', 'a', 'z', // value
+		0, // read only
+		5, // source default
+		0, // is sensitive
+		0, // empty tagged fields
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
+
+	createTopicsResponseV7 = []byte{
+		0, 0, 0, 100,
+		2,
+		6, 't', 'o', 'p', 'i', 'c',
+		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // topic ID
+		0, 42, // invalid request error
+		4, 'm', 's', 'g', // error message
+		0, 0, 0, 1, // num partitions
+		0, 2, // replication factor
+		2,                // 1 config
+		4, 'b', 'a', 'r', // name
+		4, 'b', 'a', 'z', // value
+		0, // read only
+		5, // source default
+		0, // is sensitive
+		0, // empty tagged fields
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
+
+	createTopicsResponseV5WithTopicConfigError = []byte{
+		0, 0, 0, 100,
+		2,
+		6, 't', 'o', 'p', 'i', 'c',
+		0, 42, // invalid request error
+		4, 'm', 's', 'g', // error message
+		0, 0, 0, 1, // num partitions
+		0, 2, // replication factor
+		2,                // 1 config
+		4, 'b', 'a', 'r', // name
+		4, 'b', 'a', 'z', // value
+		0,     // read only
+		5,     // source default
+		0,     // is sensitive
+		0,     // empty tagged fields
+		1,     // one tagged field
+		0,     // tag identifier
+		2,     // 2 length of data
+		0, 29, // TOPIC_AUTHORIZATION_FAILED error (see KIP-525)
+		0, // empty tagged fields
+	}
 )
 
 func TestCreateTopicsResponse(t *testing.T) {
@@ -52,6 +132,35 @@ func TestCreateTopicsResponse(t *testing.T) {
 	resp.ThrottleTime = 100 * time.Millisecond
 
 	testResponse(t, "version 2", resp, createTopicsResponseV2)
+
+	resp.Version = 5
+	resp.TopicResults = map[string]*CreatableTopicResult{
+		"topic": {
+			NumPartitions:     1,
+			ReplicationFactor: 2,
+			Configs: map[string]*CreatableTopicConfigs{
+				"bar": {
+					Value:        nullString("baz"),
+					ConfigSource: SourceDefault,
+				},
+			},
+		},
+	}
+	testResponse(t, "version 5", resp, createTopicsResponseV5)
+
+	resp.Version = 6
+	resp.TopicErrors["topic"].Err = ErrThrottlingQuotaExceeded
+	testResponse(t, "version 6", resp, createTopicsResponseV6)
+
+	resp.Version = 5
+	resp.TopicErrors["topic"].Err = ErrInvalidRequest
+	resp.TopicResults["topic"].TopicConfigErrorCode = ErrTopicAuthorizationFailed
+	testResponse(t, "version 5", resp, createTopicsResponseV5WithTopicConfigError)
+
+	resp.Version = 7
+	resp.TopicResults["topic"].TopicConfigErrorCode = ErrNoError
+	resp.TopicResults["topic"].TopicID = Uuid{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	testResponse(t, "version 7", resp, createTopicsResponseV7)
 }
 
 func TestTopicError(t *testing.T) {

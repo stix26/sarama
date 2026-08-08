@@ -190,10 +190,69 @@ var (
 		0, 3, 'g', 'i', 'd', // GroupInstanceId
 		0, 0, 0, 3, 1, 2, 3, // Metadata
 	}
+
+	joinGroupResponseV6 = []byte{
+		0, 0, 0, 100, // ThrottleTimeMs
+		0x00, 0x00, // No error
+		0x00, 0x01, 0x02, 0x03, // Generation ID
+		9, 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l', // Protocol name chosen
+		4, 'f', 'o', 'o', // Leader ID
+		4, 'b', 'a', 'r', // Member ID
+		2,                // One member info
+		4, 'm', 'i', 'd', // memberId
+		4, 'g', 'i', 'd', // GroupInstanceId
+		4, 1, 2, 3, // Metadata
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
+
+	joinGroupResponseV6MemberIDRequired = []byte{
+		0, 0, 0, 100, // throttle time
+		0, 79, // member ID required error
+		255, 255, 255, 255, // generation id
+		1, // protocol name
+		1, // leader id
+		4, 'f', 'o', 'o',
+		1, // no members
+		0, // empty tagged fields
+	}
+
+	joinGroupResponseV7 = []byte{
+		0, 0, 0, 100, // ThrottleTimeMs
+		0x00, 0x00, // No error
+		0x00, 0x01, 0x02, 0x03, // Generation ID
+		9, 'c', 'o', 'n', 's', 'u', 'm', 'e', 'r', // Protocol Type
+		9, 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l', // Protocol name chosen
+		4, 'f', 'o', 'o', // Leader ID
+		4, 'b', 'a', 'r', // Member ID
+		2,                // One member info
+		4, 'm', 'i', 'd', // memberId
+		4, 'g', 'i', 'd', // GroupInstanceId
+		4, 1, 2, 3, // Metadata
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
+
+	joinGroupResponseV8 = []byte{
+		0, 0, 0, 100, // ThrottleTimeMs
+		0x00, 0x00, // No error
+		0x00, 0x01, 0x02, 0x03, // Generation ID
+		9, 'c', 'o', 'n', 's', 'u', 'm', 'e', 'r', // Protocol Type
+		9, 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l', // Protocol name chosen
+		4, 'f', 'o', 'o', // Leader ID
+		4, 'b', 'a', 'r', // Member ID
+		2,                // One member info
+		4, 'm', 'i', 'd', // memberId
+		4, 'g', 'i', 'd', // GroupInstanceId
+		4, 1, 2, 3, // Metadata
+		0, // empty tagged fields
+		0, // empty tagged fields
+	}
 )
 
 func TestJoinGroupResponse3plus(t *testing.T) {
 	groupInstanceId := "gid"
+	protocolType := "consumer"
 	tests := []struct {
 		CaseName     string
 		Version      int16
@@ -209,6 +268,74 @@ func TestJoinGroupResponse3plus(t *testing.T) {
 				ThrottleTime:  100,
 				Err:           ErrNoError,
 				GenerationId:  0x00010203,
+				GroupProtocol: "protocol",
+				LeaderId:      "foo",
+				MemberId:      "bar",
+				Members: []GroupMember{
+					{"mid", &groupInstanceId, []byte{1, 2, 3}},
+				},
+			},
+		},
+		{
+			"v6",
+			6,
+			joinGroupResponseV6,
+			&JoinGroupResponse{
+				Version:       6,
+				ThrottleTime:  100,
+				Err:           ErrNoError,
+				GenerationId:  0x00010203,
+				GroupProtocol: "protocol",
+				LeaderId:      "foo",
+				MemberId:      "bar",
+				Members: []GroupMember{
+					{"mid", &groupInstanceId, []byte{1, 2, 3}},
+				},
+			},
+		},
+		{
+			"v6 member id required",
+			6,
+			joinGroupResponseV6MemberIDRequired,
+			&JoinGroupResponse{
+				Version:       6,
+				ThrottleTime:  100,
+				Err:           ErrMemberIdRequired,
+				GenerationId:  -1,
+				GroupProtocol: "",
+				LeaderId:      "",
+				MemberId:      "foo",
+				Members:       nil,
+			},
+		},
+		{
+			"v7",
+			7,
+			joinGroupResponseV7,
+			&JoinGroupResponse{
+				Version:       7,
+				ThrottleTime:  100,
+				Err:           ErrNoError,
+				GenerationId:  0x00010203,
+				ProtocolType:  &protocolType,
+				GroupProtocol: "protocol",
+				LeaderId:      "foo",
+				MemberId:      "bar",
+				Members: []GroupMember{
+					{"mid", &groupInstanceId, []byte{1, 2, 3}},
+				},
+			},
+		},
+		{
+			"v8",
+			8,
+			joinGroupResponseV8,
+			&JoinGroupResponse{
+				Version:       8,
+				ThrottleTime:  100,
+				Err:           ErrNoError,
+				GenerationId:  0x00010203,
+				ProtocolType:  &protocolType,
 				GroupProtocol: "protocol",
 				LeaderId:      "foo",
 				MemberId:      "bar",
