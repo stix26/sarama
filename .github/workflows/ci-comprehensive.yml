@@ -59,6 +59,7 @@ jobs:
       run: make test
       env:
         DEBUG: true
+        CGO_ENABLED: 1
 
     - name: Upload test coverage
       uses: codecov/codecov-action@v5
@@ -117,6 +118,8 @@ jobs:
 
     - name: Run functional tests
       run: make test_functional
+      env:
+        CGO_ENABLED: 1
 
   # Security Scanning
   security:
@@ -146,7 +149,7 @@ jobs:
         sarif_file: 'trivy-results.sarif'
 
     - name: Run Gosec security scanner
-      uses: securecodewarrior/github-action-gosec@master
+      uses: securego/gosec@master
       with:
         args: '-fmt sarif -out results.sarif ./...'
 
@@ -167,14 +170,15 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: golangci-lint
-      uses: golangci/golangci-lint-action@v4
+      uses: golangci/golangci-lint-action@v7
       with:
         version: latest
         args: --timeout=5m
-        goflags: -tags=functional
+      env:
+        GOFLAGS: -tags=functional
 
     - name: Staticcheck
       run: |
@@ -220,6 +224,8 @@ jobs:
     - name: Build with race detector
       run: |
         go build -race -v ./...
+      env:
+        CGO_ENABLED: 1
       if: matrix.os == 'ubuntu-latest'
 
     - name: Build with different tags
@@ -248,8 +254,8 @@ jobs:
 
     - name: Test Docker image
       run: |
-        docker run --rm sarama-kafka:test java -version
-        docker run --rm sarama-kafka:test ls -la /opt/kafka-3.6.2/
+        docker run --rm --entrypoint java sarama-kafka:test -version
+        docker run --rm --entrypoint ls sarama-kafka:test -la /opt/kafka-3.6.2/
 
     - name: Build multi-platform image
       run: |
@@ -267,7 +273,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.25'
 
     - name: Check for vulnerabilities in dependencies
       run: |
@@ -366,7 +372,9 @@ jobs:
 
     - name: Check documentation
       run: |
-        go doc ./... > /dev/null
+        for pkg in $(go list ./...); do
+          go doc "$pkg" > /dev/null || exit 1
+        done
         echo "Documentation check passed"
 
     - name: Check README links
