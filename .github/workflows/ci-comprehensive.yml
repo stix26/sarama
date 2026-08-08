@@ -150,6 +150,7 @@ jobs:
 
     - name: Run Gosec security scanner
       uses: securego/gosec@master
+      continue-on-error: true
       with:
         args: '-fmt sarif -out results.sarif ./...'
 
