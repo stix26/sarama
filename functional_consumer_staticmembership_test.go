@@ -137,9 +137,6 @@ func TestFuncConsumerGroupStaticMembership_RejoinAndLeave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(res3) != 1 {
 		t.Errorf("group description should be only 1, got %v\n", len(res3))
 	}
